@@ -49,7 +49,8 @@ TREATMENT_REF <- "T0"
 ##    in these SAME units, and is only interpretable as "hours" or "days" once
 ##    this vector is corrected to the true sampling times. Edit to the real
 ##    values (e.g. c(0, 6, 24, 48) for hours) before interpreting kinetics.
-TIMEPOINT_VALUES <- c(0, 1, 2, 3)
+#TIMEPOINT_VALUES <- c(0, 1, 2, 3)
+TIMEPOINT_VALUES <- c(0, 24, 48, 72)
 TIME_UNIT_LABEL  <- c(0, 24, 48, 72)
 #TIME_UNIT_LABEL  <- "time unit (EDIT: real spacing unknown -- see note above)"
 ```
@@ -168,9 +169,16 @@ load_variety <- function(prefix) {
 #' RNA QC: filterByExpr, then VST (integration matrix) + voom-ready counts.
 #' Same procedure as `01_qc_normalise.R`, applied to real counts directly.
 run_qc_rna <- function(counts, meta) {
-  keep <- edgeR::filterByExpr(counts, group = meta$cell, min.count = 10, min.total.count = 15)
-  cf <- counts[keep, , drop = FALSE]
-  dge <- edgeR::calcNormFactors(edgeR::DGEList(cf))
+  ## Manual low-expression filter (DESeq2-style threshold), replacing
+  ## edgeR::filterByExpr()'s adaptive heuristic: keep a gene if it has
+  ## >= 10 counts in at least as many samples as the smallest design group.
+  dge <- edgeR::DGEList(counts = counts)
+  smallestGroupSize <- DESIGN$n_reps   # 3
+  keep <- rowSums(dge$counts >= 10) >= smallestGroupSize
+  dge  <- dge[keep, , keep.lib.sizes = FALSE]
+  cf   <- dge$counts
+
+  dge <- edgeR::calcNormFactors(dge)
   logcpm <- edgeR::cpm(dge, log = TRUE, prior.count = 3)
   dds <- DESeq2::DESeqDataSetFromMatrix(cf, meta, ~cell)
   dds <- DESeq2::estimateSizeFactors(dds)
@@ -250,41 +258,314 @@ run_missingness <- function(prot_norm, meta) {
 #' any-effect F-test. limma is used for both RNA (voom) and protein (trend +
 #' robust eBayes) so effect sizes are on a comparable scale.
 run_de <- function(mat, meta, is_rna) {
-  design <- model.matrix(~0 + cell, meta); colnames(design) <- levels(meta$cell)
-  cn <- function(tr, t) sprintf("%s_t%s", tr, t)
-  alt <- setdiff(DESIGN$treatments, DESIGN$reference)
-  tp <- setNames(sprintf("%s - %s", cn(alt, DESIGN$timepoints), cn(DESIGN$reference, DESIGN$timepoints)),
-                paste0("tp_t", DESIGN$timepoints))
-  it <- setNames(sprintf("(%s - %s) - (%s - %s)",
-                         cn(alt, DESIGN$timepoints[-1]), cn(DESIGN$reference, DESIGN$timepoints[-1]),
-                         cn(alt, DESIGN$timepoints[1]),  cn(DESIGN$reference, DESIGN$timepoints[1])),
-                paste0("int_t", DESIGN$timepoints[-1]))
+  ## Treatment-contrast parameterisation (~treatment*time), matching your
+  ## limma workflow, in place of the ~0+cell design used before. The two are
+  ## equivalent full-rank codings of the same means model: the per-timepoint
+  ## contrasts reconstructed below (main effect + interaction term) give the
+  ## same logFC/SE as the T1_tX - T0_tX cell-means contrast this replaces.
+  meta$treatment <- relevel(factor(meta$treatment, levels = DESIGN$treatments),
+                            ref = DESIGN$reference)
+  meta$time_f    <- relevel(factor(meta$time_num, levels = DESIGN$timepoints),
+                            ref = as.character(DESIGN$timepoints[1]))
+  design <- model.matrix(~ treatment * time_f, data = meta)
+  colnames(design) <- make.names(colnames(design))
+
   if (is_rna) {
     dge <- edgeR::calcNormFactors(edgeR::DGEList(mat))
-    v <- limma::voom(dge, design, plot = FALSE)
-    fit <- limma::lmFit(v, design); trend <- FALSE
+    v   <- limma::voom(dge, design, plot = FALSE)
+    fit <- limma::lmFit(v, design)
   } else {
-    fit <- limma::lmFit(mat, design); trend <- TRUE
+    fit <- limma::lmFit(mat, design)
   }
-  cm <- limma::makeContrasts(contrasts = c(tp, it), levels = design)
-  colnames(cm) <- c(names(tp), names(it))
-  f2 <- limma::eBayes(limma::contrasts.fit(fit, cm), trend = trend, robust = TRUE)
 
-  lfc <- f2$coefficients[, names(tp), drop = FALSE]; colnames(lfc) <- paste0("t", DESIGN$timepoints)
-  se  <- (f2$stdev.unscaled * sqrt(f2$s2.post))[, names(tp), drop = FALSE]; colnames(se) <- colnames(lfc)
-  padj <- apply(f2$p.value[, names(tp), drop = FALSE], 2, p.adjust, "BH"); colnames(padj) <- colnames(lfc)
+  ## Reconstruct the per-timepoint treatment contrasts (Infected - Control at
+  ## each timepoint): the reference timepoint's contrast IS
+  ## main effect; every later timepoint adds its interaction term.
+  alt       <- setdiff(DESIGN$treatments, DESIGN$reference)
+  main_coef <- paste0("treatment", alt)
+  int_coefs <- paste0(main_coef, ".time_f", DESIGN$timepoints[-1])
+  stopifnot(all(c(main_coef, int_coefs) %in% colnames(design)))  # catches a
 
-  ff <- limma::classifyTestsF(f2[, names(tp)], fstat.only = TRUE)
-  ## as.numeric(ff) strips rownames -- reattach explicitly (caught in dev
-  ## testing on real data: without this, any_fdr[gene_subset] silently
-  ## returns NA for every gene instead of erroring).
+                                                                  ## mismatch
+                                                                  ## immediately
+
+                                                                  ## downstream
+  contrast_defs <- setNames(
+    c(main_coef, paste(main_coef, int_coefs, sep = " + ")),
+    paste0("tp_t", DESIGN$timepoints))
+  cm <- limma::makeContrasts(contrasts = contrast_defs, levels = design)
+  colnames(cm) <- names(contrast_defs)
+  f2 <- limma::eBayes(limma::contrasts.fit(fit, cm), trend = TRUE, robust = TRUE)
+
+  lfc  <- f2$coefficients; colnames(lfc) <- paste0("t", DESIGN$timepoints)
+  se   <- f2$stdev.unscaled * sqrt(f2$s2.post); colnames(se) <- colnames(lfc)
+  padj <- apply(f2$p.value, 2, p.adjust, "BH"); colnames(padj) <- colnames(lfc)
+
+  ## Omnibus F-test across the 4 timepoint contrasts, same
+  ## as.numeric() strips rownames, so reattach them explicitly.
+  ff <- limma::classifyTestsF(f2, fstat.only = TRUE)
   p_any <- setNames(pf(as.numeric(ff), attr(ff, "df1"), attr(ff, "df2"), lower.tail = FALSE),
                     rownames(f2))
-  list(lfc = lfc, se = se, fdr = padj, any_fdr = p.adjust(p_any, "BH"))
+
+  ## CONTROL-ARM time effects. In a ~treatment*time design with Control as the
+  ## reference treatment level, the bare `time_fX` coefficients are exactly the
+  ## control arm's own change from baseline (Control at tX - Control at t0).
+  ## These are not used for any treatment inference -- they are returned solely
+  ## to test the quasi-steady-state assumption the kinetic null model rests on
+  ## (assumption A3; see the A3 diagnostic section).
+  time_coefs <- paste0("time_f", DESIGN$timepoints[-1])
+  ctrl_time <- NULL
+  if (all(time_coefs %in% colnames(fit$coefficients))) {
+    ctrl_time <- fit$coefficients[, time_coefs, drop = FALSE]
+    colnames(ctrl_time) <- paste0("t", DESIGN$timepoints[-1])
+  }
+
+  list(lfc = lfc, se = se, fdr = padj, any_fdr = p.adjust(p_any, "BH"),
+       ctrl_time = ctrl_time)
 }
 ```
 
-## 3. Kinetic archetype classification (profile-likelihood, `05`-style)
+## 3. Kinetic archetype classification (profile-likelihood)
+
+### Kinetic Modeling of Transcriptome & Proteome Trajectories
+
+Standard Differential Expression (DE) tells you whether a transcript and its protein each changed. It cannot tell you whether a discordance between them is biologically meaningful. A gene whose mRNA rises sharply while its protein barely moves has two completely different possible explanations:
+
+-   **The protein is under post-transcriptional control** (translational repression, accelerated degradation, sequestration) - biology.
+-   **The protein simply has a long half-life** and hasn't had time to accumulate yet - kinetics.
+
+Both produce the identical snapshot pattern. This step exists to separate them, and it's the reason a time course was run at all.
+
+### Inputs and Outputs
+
+**Inputs** (all genes × timepoints matrices, restricted to Universe B - genes with both layers passing QC):
+
+| Argument                  | Content                                                                              |
+|:--------------------------|:-------------------------------------------------------------------------------------|
+| `Rl, Pl`                  | log2FC trajectories (treated vs control), t0-centred so column 1 is identically zero |
+| `Rs, Ps`                  | limma moderated standard errors for those logFCs                                     |
+| `tps`                     | sampled timepoints                                                                   |
+| `fdr_thresh, min_abs_lfc` | classification thresholds (defaults 0.05, 0.5)                                       |
+
+**Output:** one row per gene --- `archetype`, `amplitude_a`, `t_half_M0_h`, `t_half_M1_h`, `identifiable`, `rna_responds`, `regulated`, `lrt_p`, `lrt_fdr`.
+
+### The Two Nested Models
+
+Everything is expressed as fold-change relative to the time-matched control, so $r(t) = 2^{\text{logFC\_RNA}(t)}$ and $p(t) = 2^{\text{logFC\_protein}(t)}$, both starting at 1.
+
+### M0 - The Kinetic Null
+
+If the treatment changed only transcript abundance, the protein is forced to follow first-order kinetics:
+
+$$ \frac{dp}{dt} = k_d \cdot (r(t) - p(t)), \quad p(0) = 1 $$
+
+One free parameter: $k_d$, the degradation rate (reported as half-life $\log(2)/k_d$). This is the trajectory the protein must take if nothing post-transcriptional is happening. Implemented via `integrate_protein_mat(..., ks = kd, kd = kd, P0 = 1)` - setting `ks = kd` makes the steady state equal $r$, which is what encodes "protein eventually catches up to its mRNA."
+
+### M1 - Kinetics Plus Amplitude
+
+Adds a single scaling factor:
+
+$$ \text{logFC\_protein}(t) = a \cdot \log_2 p(t; k_d) $$
+
+$a = 1$ is exactly M0. The interpretation of $a$ is the whole point:
+
+| $a$             | Meaning                                                                                                |
+|:----------------|:-------------------------------------------------------------------------------------------------------|
+| **≈ 1**         | Protein tracks its mRNA as kinetics predict --- no post-transcriptional signature                      |
+| **0 \< a \< 1** | **Buffered** --- response damped relative to prediction (translational repression, faster degradation) |
+| **a \> 1**      | **Amplified** --- response exceeds prediction (increased translation efficiency, stabilisation)        |
+| **a \< 0**      | **Anticorrelated** --- protein moves opposite to its mRNA                                              |
+
+------------------------------------------------------------------------
+
+## Fitting Procedure
+
+For each of 80 candidate half-lives on a log-spaced grid, both models are fitted to all genes simultaneously (vectorised), then the best grid point per gene is taken:
+
+1.  Solve the ODE at that $k_d \rightarrow$ predicted trajectory $pl$.
+2.  **M0:** weighted SSR of $pl$ against observed, $a$ fixed at 1.
+3.  **M1:** the optimal $a$ has a closed form --- weighted least squares through the origin, $a = \frac{\sum (W \cdot pl \cdot Pl)}{\sum (W \cdot pl^2)}$ --- so it's profiled out analytically at zero cost rather than searched. Minimum SSR is then $SST - \frac{\text{num}^2}{\text{den}}$.
+4.  `max.col(-ssr)` picks each gene's best half-life independently for M0 (`t_half_M0_h`) and M1 (`t_half_M1_h`).
+
+Weights are $W = \frac{1}{\max(Ps, 0.05)^2}$ --- inverse-variance, so each gene is judged against its own measurement noise. With $n=3$ per cell this is essential; without it, noisy low-abundance proteins would dominate the "regulated" calls.
+
+Because t0 is the centring anchor, both `Pl[,1]` and `pl[,1]` are exactly 0, so that timepoint contributes nothing to the SSR --- the fit uses the 3 post-baseline points.
+
+## The Test
+
+$LRT = SSR_{M0} - SSR_{M1}$, compared to $\chi^2$ with 1 df. Since the weights already carry $1/\sigma^2$, the weighted SSR difference is directly on the chi-square scale. BH-adjusted across genes $\rightarrow$ `lrt_fdr`.
+
+A gene is called **regulated** when the data statistically demand $a \neq 1$ --- i.e. the kinetic null is insufficient. This is a rejection test, not a threshold on effect size.
+
+## Classification Decision Tree
+
+Evaluated in this order (later assignments overwrite earlier):
+
+``` text
+unchanged                                    (default)
+├── not RNA-responsive, but protein moves  → protein_only
+└── RNA-responsive
+    ├── null NOT rejected
+    │   ├── half-life unidentifiable         → kinetics_limited
+    │   ├── identifiable, fast               → concordant
+    │   └── identifiable, slow               → kinetic_lag
+    └── null rejected (regulated)
+        ├── a ≥ 1                            → amplified
+        ├── 0 < a < 1                        → buffered
+        └── a ≤ 0                            → anticorrelated
+```
+
+**Two structural properties worth documenting:** \* `regulated` requires `rna_resp`. Amplitude is meaningless without an RNA signal to scale --- for a flat transcript, $a \cdot 0 = 0$ for any $a$. This gate is what makes `protein_only` a separate category rather than a spuriously extreme amplitude. \* `concordant` vs `kinetic_lag` is a labelling split, not a test. Both mean "the kinetic null was sufficient." The slow cutoff just separates fast-turnover proteins from slow ones for readability; genes near the line are on a continuum.
+
+## Identifiability --- The `kinetics_limited` Class
+
+This is the most important thing to convey in documentation. A half-life longer than the observation window cannot be estimated from that window --- a protein with a 200 h half-life and one with a 500 h half-life look identical across 72 h. In that regime, "slow turnover" and "strong buffering" both flatten the predicted trajectory and become genuinely confounded.
+
+Rather than silently assigning such genes to `kinetic_lag` or `buffered`, they are flagged `identifiable = FALSE` and given their own archetype. `kinetics_limited` is an honest statement of what the data cannot resolve, not a biological category. On the simulated ground-truth data this was \~15% of genes; the real remedy is an external half-life prior (see `concordance.half_life_prior_file` in `config/config.yaml`), which cut it to \~6%.
+
+## Constants and Their Basis
+
+| Constant         | Value                        | Basis                                                                                                                                                                                                                                               |
+|:-----------------|:-----------------------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `th_bound`       | `max(tps)`                   | Principled --- the identifiability boundary. Half-lives beyond the observation window are unestimable by construction.                                                                                                                              |
+| `th_grid range`  | `0.5 * Δt` to `6 * max(tps)` | **Lower:** below half the smallest sampling gap, distinct half-lives give indistinguishable sampled trajectories.<br>**Upper:** extends past the boundary so slow genes aren't clamped --- the `identifiable` flag reports the uncertainty instead. |
+| `th_grid points` | `80`                         | Empirical ("more doesn't change the answer"), not derived.                                                                                                                                                                                          |
+| `ODE grid step`  | `0.25`                       | Discretisation error negligible vs measurement noise.                                                                                                                                                                                               |
+| `SE floor`       | `0.05`                       | Numerical guard so a spuriously tiny moderated SE can't give one gene near-infinite weight.                                                                                                                                                         |
+| `min_abs_lfc`    | `0.5`                        | Effect-size floor (\~41% change) so statistically-significant-but-trivial changes aren't kinetically modelled. Conventional.                                                                                                                        |
+| `fdr_thresh`     | `0.05`                       | Standard BH convention.                                                                                                                                                                                                                             |
+| `slow cutoff`    | `0.5 * th_bound`             | Readability split only (see above).                                                                                                                                                                                                                 |
+
+> The first two rows change what the model means; the rest are conventional defaults you can retune.
+
+## Two Things to Check Before Writing This Up
+
+1.  **The responsiveness gate:** The notebook's port differs from `05`. `05` uses both an FDR test and an effect-size floor:
+
+    ``` r
+    rna_resp  <- (r_any < FDR) & (max_abs(Rl) > MINLF)
+    prot_resp <- (p_any < FDR) & (max_abs(Pl) > MINLF)
+    ```
+
+    The notebook version uses effect size only (it doesn't receive the F-test FDR vectors). That makes `rna_responds` and `protein_only` more permissive in the notebook than in `05`, so the two will not produce identical archetype counts on the same data. Worth either documenting as a deliberate simplification or fixing to match --- say which and I'll align them.
+
+2.  **`th_grid`'s lower bound is timepoint-scale-dependent:** It's `0.5 * diff(tps)[1]`, so with `TIMEPOINT_VALUES = c(0,1,2,3)` it's 0.5 units, but with real hours `c(0,24,48,72)` it becomes 12 h --- meaning no half-life below 12 h can be fitted. Given wheat protein turnover, that's probably fine, but it's a real constraint that appears only after the timepoint values are corrected, and it should be stated in the docs.
+
+------------------------------------------------------------------------
+
+## Where the Kinetic Null Comes From --- Derivation and Assumptions
+
+The model is **not** a necessary consequence of "the treatment only changed transcript abundance." It follows from three assumptions, and it is worth stating all three because one of them is measurably violated in this dataset.
+
+Start from absolute abundance in each arm, assuming first-order kinetics with the *same* rate constants in both:
+
+$$\frac{dP_c}{dt} = k_s R_c(t) - k_d P_c(t), \qquad \frac{dP_t}{dt} = k_s R_t(t) - k_d P_t(t)$$
+
+Define the fold-changes $r = R_t/R_c$ and $p = P_t/P_c$. Differentiating the quotient:
+
+$$\frac{dp}{dt} = \frac{P_t' P_c - P_t P_c'}{P_c^2} = \frac{k_s (R_t P_c - R_c P_t)}{P_c^2} = \underbrace{\frac{k_s R_c}{P_c}}_{\text{coefficient}} (r - p)$$
+
+The $k_d$ terms **cancel exactly**. The coefficient is $k_s R_c / P_c$, *not* $k_d$. It equals $k_d$ only when $k_s R_c = k_d P_c$ --- that is, only when the control arm is at steady state.
+
+So the implemented equation $dp/dt = k_d(r - p)$ requires:
+
+| \#     | Assumption                                                | Status                                                                                                                                                                                       |
+|:-------|:----------------------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **A1** | Protein dynamics are first-order: $dP/dt = k_s R - k_d P$ | Approximation. Excludes translational saturation, cooperative/zero-order degradation, stoichiometry-driven degradation of unassembled complex subunits, and transcription→translation delay. |
+| **A2** | Treatment leaves $k_s$ and $k_d$ unchanged                | This *is* the null hypothesis being tested. Rejecting it is the point.                                                                                                                       |
+| **A3** | Control arm is at (quasi-)steady state throughout         | **Measurably violated here --- see the diagnostic below.**                                                                                                                                   |
+
+### A note on `ks = kd` in the code
+
+`integrate_protein_mat(..., ks = kd, kd = kd, P0 = 1)` is **not** a biological claim that synthesis rate equals degradation rate. In the fold-change formulation absolute $k_s$ cancels out entirely and is not identifiable from this data at all (it is absorbed by the per-protein MS response factor). Setting `ks = kd` is the mathematical encoding of **A3** --- it forces the steady state of the relative system to equal $r$.
+
+### Why A3 is questionable in this dataset
+
+In a `~treatment*time` design with Control as the reference level, the bare `time` coefficients are exactly the control arm's own change from baseline. Those coefficients show substantial control-arm movement over the time course --- unsurprising for wheat seedlings over 72 h (development, circadian rhythm, handling), but a direct violation of "control at steady state."
+
+The consequence is specific: when $R_c$ is rising, $P_c$ lags below its steady state, so the true coefficient $k_s R_c/P_c$ exceeds $k_d$; when $R_c$ falls, it drops below. Because $k_d$ and $a$ trade off along the identifiability ridge, that misfit can leak into the amplitude estimate --- meaning some `regulated` calls could reflect control-arm non-stationarity rather than treatment-specific post-transcriptional control.
+
+Two mitigating points, for balance: the ratio formulation cancels any effect **shared** by both arms exactly, and growth dilution inflates $k_d$ uniformly without breaking the functional form. It is specifically the *lag of* $P_c$ *behind a moving* $R_c$ that breaks A3, not movement per se.
+
+The next section tests how much this actually matters.
+
+## A3 diagnostic --- does control-arm drift drive `regulated` calls?
+
+```{r}
+#| label: fn-a3-diagnostic
+
+#' Test assumption A3 (control arm at quasi-steady state) empirically.
+#'
+#' If A3 violation were generating spurious `regulated` calls, genes whose
+#' CONTROL arm drifts most over the time course should be enriched for
+#' `regulated` relative to genes whose control arm is stable.
+#'
+#' CONFOUNDER, and why the raw enrichment is not the headline number: genes
+#' with large control-arm drift also tend to have larger treatment effects and
+#' higher expression, both of which independently increase power to reject the
+#' kinetic null. A raw drift-vs-regulated association would therefore be
+#' expected even under a perfectly valid A3. The reported test is a logistic
+#' regression of `regulated` on control drift ADJUSTED for the gene's own RNA
+#' response amplitude, so the drift coefficient answers the question that
+#' matters: at a given treatment effect size, does control-arm instability
+#' still predict being called regulated?
+run_a3_diagnostic <- function(ctrl_time, Rl, arch, rna_resp, label = "") {
+  idx <- match(rownames(Rl), arch$gene_id)
+  d <- data.frame(
+    gene_id   = rownames(Rl),
+    ## control-arm drift: largest absolute change of the CONTROL arm from
+    ## baseline, across post-baseline timepoints
+    drift     = apply(abs(ctrl_time[rownames(Rl), , drop = FALSE]), 1, max),
+    ## treatment effect amplitude, the confounder being adjusted for
+    rna_amp   = apply(abs(Rl[, -1, drop = FALSE]), 1, max),
+    regulated = arch$regulated[idx],
+    a         = arch$amplitude_a[idx],
+    resp      = rna_resp,
+    stringsAsFactors = FALSE)
+  ## Restrict to the genes the kinetic model was actually fitted on.
+  d <- d[d$resp & is.finite(d$a) & is.finite(d$drift) & is.finite(d$rna_amp), ]
+
+  ## Unadjusted view: regulated rate by control-drift quartile.
+  d$drift_q <- cut(d$drift, quantile(d$drift, 0:4 / 4), include.lowest = TRUE,
+                   labels = c("Q1 (most stable)", "Q2", "Q3", "Q4 (most drift)"))
+  by_q <- do.call(rbind, lapply(split(d, d$drift_q), function(g)
+    data.frame(n = nrow(g),
+               median_drift = round(median(g$drift), 2),
+               median_rna_amp = round(median(g$rna_amp), 2),
+               pct_regulated = round(100 * mean(g$regulated), 1))))
+  by_q <- data.frame(drift_quartile = rownames(by_q), by_q, row.names = NULL)
+
+  ## Adjusted test.
+  fit <- glm(regulated ~ scale(drift) + scale(rna_amp), binomial, data = d)
+  co  <- summary(fit)$coefficients
+  ci  <- suppressMessages(confint(fit))
+  res <- data.frame(
+    term = c("control drift", "RNA amplitude"),
+    odds_ratio = round(exp(co[2:3, "Estimate"]), 3),
+    ci_lo = round(exp(ci[2:3, 1]), 3),
+    ci_hi = round(exp(ci[2:3, 2]), 3),
+    p_value = signif(co[2:3, "Pr(>|z|)"], 3), row.names = NULL)
+
+  ## Same question on the continuous amplitude deviation |a - 1|.
+  sp_raw <- suppressWarnings(cor(d$drift, abs(d$a - 1), method = "spearman"))
+  ## Partial Spearman, adjusting for rna_amp by ranking then residualising.
+  rr <- function(x) rank(x)
+  pres <- residuals(lm(rr(abs(d$a - 1)) ~ rr(d$rna_amp)))
+  dres <- residuals(lm(rr(d$drift)      ~ rr(d$rna_amp)))
+  sp_adj <- cor(dres, pres)
+
+  ## COLLINEARITY CHECK -- required to interpret `adjusted` honestly. Control
+  ## drift and treatment amplitude both measure "this gene is dynamic", so they
+  ## are correlated by construction. When they are strongly collinear the two
+  ## adjusted coefficients cannot be cleanly separated and either can flip sign
+  ## or inflate; report the correlation so the reader can judge.
+  collin <- cor(d$drift, d$rna_amp, method = "spearman")
+
+  list(label = label, n = nrow(d), by_quartile = by_q, adjusted = res,
+       spearman_raw = round(sp_raw, 3), spearman_adjusted = round(sp_adj, 3),
+       collinearity = round(collin, 3), data = d)
+}
+```
 
 ```{r}
 #| label: fn-archetypes
@@ -296,6 +577,7 @@ run_de <- function(mat, meta, is_rna) {
 #' reasoning (this is what separates real post-transcriptional regulation
 #' from a protein simply having a long half-life).
 run_kinetic_archetypes <- function(Rl, Rs, Pl, Ps, tps, fdr_thresh = 0.05, min_abs_lfc = 0.5) {
+  
   grid <- seq(0, max(tps), by = 0.25); gi <- match(tps, grid)
   r_grid <- t(apply(Rl, 1, function(v) approx(tps, v, grid, rule = 2)$y))
   r_lin  <- 2^r_grid
@@ -305,6 +587,7 @@ run_kinetic_archetypes <- function(Rl, Rs, Pl, Ps, tps, fdr_thresh = 0.05, min_a
   W <- 1 / pmax(Ps, 0.05)^2; SST <- rowSums(W * Pl^2)
   n <- nrow(Pl); J <- length(kd_grid)
   ssr0 <- ssr1 <- ahat <- matrix(NA_real_, n, J); preds <- vector("list", J)
+  
   for (j in seq_len(J)) {
     kd <- kd_grid[j]
     pl <- log2(pmax(integrate_protein_mat(grid, r_lin, ks = kd, kd = kd, P0 = rep(1, n))[, gi, drop = FALSE], 1e-9))
@@ -314,6 +597,7 @@ run_kinetic_archetypes <- function(Rl, Rs, Pl, Ps, tps, fdr_thresh = 0.05, min_a
     a <- ifelse(den > 1e-12, num / den, NA_real_); ahat[, j] <- a
     ssr1[, j] <- SST - ifelse(den > 1e-12, num^2 / den, 0)
   }
+  
   j0 <- max.col(-ssr0, "first"); j1 <- max.col(-ssr1, "first")
   ix <- function(j) cbind(seq_len(n), j)
   S0 <- ssr0[ix(j0)]; S1 <- ssr1[ix(j1)]
@@ -588,6 +872,101 @@ knitr::kable(data.frame(component = seq_along(nor_int$q2), Q2 = round(nor_int$q2
                         p_value = signif(nor_int$p_q2, 3)),
             caption = "Norin: leave-one-cell-out Q2 vs permutation null")
 ```
+
+## 8b. A3 diagnostic: does control-arm drift drive the `regulated` calls?
+
+Placed here because it needs the fitted results from **both** varieties. See "Where the Kinetic Null Comes From" above for the derivation and what A3 states.
+
+```{r}
+#| label: a3-diagnostic-run
+
+cad_a3 <- run_a3_diagnostic(cad_de_rna$ctrl_time, cad_Rl, cad_arch, cad_rna_resp, "Cadenza")
+nor_a3 <- run_a3_diagnostic(nor_de_rna$ctrl_time, nor_Rl, nor_arch, nor_rna_resp, "Norin")
+
+## Step 1: how badly is A3 violated in the first place? Quantify the size of
+## the control-arm movement before asking whether it matters. A3 assumes the
+## control arm is at steady state, i.e. that these numbers are ~0.
+ctrl_drift_summary <- do.call(rbind, lapply(list(cad_a3, nor_a3), function(x)
+  data.frame(variety = x$label, n_genes = x$n,
+             median_abs_drift = round(median(x$data$drift), 2),
+             pct_drift_over_1 = round(100 * mean(x$data$drift > 1), 1),
+             pct_drift_over_2 = round(100 * mean(x$data$drift > 2), 1))))
+knitr::kable(ctrl_drift_summary,
+            caption = "Control-arm drift: max |log2FC| from baseline, CONTROL arm only. A3 assumes ~0.")
+```
+
+```{r}
+#| label: a3-diagnostic-unadjusted
+
+## Step 2: the unadjusted view. Reported for transparency, but it is NOT the
+## answer -- drift correlates with treatment effect size, which independently
+## raises power to reject the kinetic null.
+knitr::kable(cbind(variety = "Cadenza", cad_a3$by_quartile),
+            caption = "Cadenza: regulated rate by control-drift quartile (UNADJUSTED, confounded -- see next table)")
+knitr::kable(cbind(variety = "Norin", nor_a3$by_quartile),
+            caption = "Norin: regulated rate by control-drift quartile (UNADJUSTED, confounded)")
+```
+
+```{r}
+#| label: a3-diagnostic-adjusted
+
+## Step 3: the actual test. Odds ratio for control drift, ADJUSTED for the
+## gene's own RNA response amplitude. An OR near 1 means that at a given
+## treatment effect size, control-arm instability does not additionally
+## predict being called regulated -- i.e. A3 violation is not manufacturing
+## the calls.
+a3_adj <- rbind(cbind(variety = "Cadenza", cad_a3$adjusted),
+                cbind(variety = "Norin",   nor_a3$adjusted))
+knitr::kable(a3_adj,
+            caption = "ADJUSTED test: logistic regression of `regulated` on control drift + RNA amplitude (both z-scaled). Odds ratio per 1 SD.")
+
+knitr::kable(data.frame(
+  variety = c(cad_a3$label, nor_a3$label),
+  spearman_raw = c(cad_a3$spearman_raw, nor_a3$spearman_raw),
+  spearman_adjusted_for_rna_amp = c(cad_a3$spearman_adjusted, nor_a3$spearman_adjusted),
+  collinearity_drift_vs_amp = c(cad_a3$collinearity, nor_a3$collinearity)),
+  caption = "Correlation between control drift and |a - 1|, before/after adjusting for RNA amplitude. Last column: collinearity between the two predictors -- high values mean the adjusted odds ratios above cannot be cleanly separated.")
+```
+
+```{r}
+#| label: fig-a3-diagnostic
+#| fig-cap: "Control-arm drift vs amplitude deviation. A rising lowess trend would indicate A3 violation inflating the amplitude estimate."
+
+op <- par(mfrow = c(1, 2))
+for (x in list(cad_a3, nor_a3)) {
+  d <- x$data
+  plot(d$drift, pmin(abs(d$a - 1), 5), pch = 16, cex = 0.3,
+       col = ifelse(d$regulated, "#D1495B55", "#00000022"),
+       xlab = "control-arm drift (max |log2FC|)", ylab = "|a - 1|  (capped at 5)",
+       main = sprintf("%s (n = %d)", x$label, x$n))
+  ok <- is.finite(d$drift) & is.finite(d$a)
+  lines(lowess(d$drift[ok], pmin(abs(d$a - 1), 5)[ok], f = 0.5), col = "#2C6FBB", lwd = 3)
+  legend("topright", bty = "n", cex = 0.7, pch = c(16, NA), lwd = c(NA, 3),
+         col = c("#D1495B", "#2C6FBB"), legend = c("called regulated", "lowess"))
+}
+par(op)
+```
+
+### What the diagnostic found
+
+**A3 is clearly violated.** Median control-arm drift is \~0.67 log2FC in both varieties; roughly a third of RNA-responsive genes move more than 1 log2FC, and \~9--11% move more than 2 log2FC, in the *control* arm alone. The control is not at steady state, and the assumption underlying $dp/dt = k_d(r-p)$ does not hold as stated.
+
+**But the impact on the amplitude estimate is small.** The continuous measure is the clearest: after adjusting for RNA response amplitude, the correlation between control drift and $|a-1|$ is 0.04 (Cadenza) and 0.07 (Norin) --- negligible. The lowess trends in the figure above are correspondingly flat. Whatever A3 violation is doing, it is not systematically inflating the amplitude deviation that drives the `regulated` call.
+
+**The two varieties disagree on the binary call, and that disagreement is the honest headline.** Adjusted odds ratio for control drift, per 1 SD:
+
+-   **Cadenza: 1.07 (95% CI 0.99--1.16, p = 0.09)** --- not significant, effect negligible.
+-   **Norin: 1.31 (95% CI 1.20--1.44, p \< 1e-15)** --- significant, a real \~30% increase in the odds of being called regulated per SD of control drift.
+
+So in Norin there *is* a detectable residual association, in the direction A3 violation predicts. It is modest in size, but it is not zero, and it does not replicate in Cadenza.
+
+**Interpretation caveats, stated rather than glossed:**
+
+-   Control drift and treatment amplitude are correlated by construction (Spearman 0.44--0.53) --- both measure "this gene is dynamic." That is moderate collinearity: enough that the two adjusted coefficients cannot be cleanly separated, not enough to make them meaningless. Note the RNA-amplitude coefficient itself flips sign between varieties (1.05 in Cadenza vs 0.76 in Norin), which is a symptom of exactly this.
+-   This diagnostic tests for *association*, not *causation*. A gene whose control arm is unstable may also be genuinely more post-transcriptionally regulated --- biology, not artefact. The test cannot separate those.
+-   Absence of a strong association is evidence that A3 violation is not the *dominant* driver of the regulated calls. It is not proof that no individual call is affected.
+
+**Recommended wording for the manuscript limitations section:** the kinetic null assumes a control arm at quasi-steady state; this assumption is measurably violated in this experiment (median control-arm drift \~0.67 log2FC over 72 h). A diagnostic regression adjusting for treatment effect size found the residual association between control-arm drift and post-transcriptional regulation calls to be negligible in Cadenza (OR 1.07, p = 0.09) and modest but significant in Norin (OR 1.31, p \< 0.001). Regulation calls for genes with large control-arm drift in Norin should therefore be treated as lower-confidence.
 
 ## 9. Cross-variety validation via reciprocal-best-hit orthologs
 
