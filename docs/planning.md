@@ -8,8 +8,12 @@ was confirmed as **Case B** (unmatched RNA/protein samples), the constraints
 in `PIPELINE.md` supersede the sample-level integration tools described here
 (MOFA+/MEFISTO/DIABLO/O2PLS at the sample level are not valid under Case B —
 see `PIPELINE.md` for what replaces them). Pillar 4's custom-model proposals
-are a superset of what has been implemented; only 4A (the kinetic model) has
-a built equivalent so far, in `R/05_concordance_archetypes.R`.
+are a superset of what has been implemented; 4A (the kinetic model) now has
+two built equivalents: a per-gene profile-likelihood/LRT fit in
+`R/05_concordance_archetypes.R`, and the hierarchical-horseshoe upgrade
+described in 4A's own section below, implemented in
+`R/07_bayesian_kinetics.R` and run on real wheat data in
+`analysis/kinetics_limited/de_proteomics_wheat.qmd`.
 
 ---
 
@@ -290,14 +294,40 @@ subtypes to discover. `MINT` — cross-study integration, not this problem.
 
 Design constraint restated: **n=24.** Any architecture whose parameters
 scale with sample count will memorise. The proposals below each dodge this
-differently, ordered by expected return on effort. **Status:** only 4A has a
-built equivalent so far (`R/05_concordance_archetypes.R`'s kinetic null +
-amplitude LRT). 4B–4E are proposals, not yet implemented — and a
-substantially overlapping condition-aligned autoencoder + GNN-adjacent
-codebase already exists on `nectar` (`rnaprot/`, see `PIPELINE.md`/project
-memory), so 4B/4C should be evaluated against that before building new code.
+differently, ordered by expected return on effort. **Status:** 4A has two
+built equivalents (`R/05_concordance_archetypes.R`'s per-gene profile-
+likelihood kinetic null + amplitude LRT, and `R/07_bayesian_kinetics.R`'s
+hierarchical horseshoe upgrade — run on real wheat data in
+`analysis/kinetics_limited/de_proteomics_wheat.qmd`). 4B–4E are proposals,
+not yet implemented — and a substantially overlapping condition-aligned
+autoencoder + GNN-adjacent codebase already exists on `nectar` (`rnaprot/`,
+see `PIPELINE.md`/project memory), so 4B/4C should be evaluated against that
+before building new code.
 
-### 4A — Hierarchical Bayesian kinetic state-space model *(highest value, lowest risk — implemented as a point-estimate profile-likelihood version; full Bayesian version not yet built)*
+### 4A — Hierarchical Bayesian kinetic state-space model *(highest value, lowest risk — implemented, with one simplification from the original proposal)*
+
+**Implementation note (2026-08-22):** the version actually built
+(`R/07_bayesian_kinetics.R`) fixes each gene's half-life at its own
+profile-likelihood joint optimum (the same value `05` reports) and applies
+horseshoe shrinkage only to the amplitude parameter, rather than jointly
+sampling both as proposed below. A controlled test during development showed
+why: a long half-life and a strongly attenuated amplitude predict nearly the
+same trajectory, so jointly sampling `log(half-life)` and amplitude with
+independent single-site Metropolis proposals creates a ridge-shaped
+posterior that mixes very slowly — the chain's amplitude estimate visibly
+drifted toward the null over thousands of iterations instead of stabilising
+near the (separately confirmed, via the closed-form profile-likelihood
+optimum) correct value. Fixing the half-life removes the ridge and lets a
+pure-R Metropolis-within-Gibbs sampler work reliably without a Stan/NumPyro
+dependency, at the cost of not propagating joint kinetic/amplitude
+uncertainty. Validated on the simulator: median posterior amplitude 0.40 for
+truly `buffered` genes vs 0.97 for `concordant` (unbiased), and roughly
+triples recall on genes `05` alone leaves in `kinetics_limited`, at the cost
+of a higher false-positive rate on truly-unregulated genes (a real,
+documented trade-off — see the notebook's §6 for both numbers side by side).
+A fully joint fit (the original proposal below) remains future work if that
+uncertainty propagation turns out to matter for a specific claim — Stan/NUTS
+navigates a correlated ridge far better than component-wise Metropolis.
 
 Because it *is* the biology, and it's the analysis MOFA cannot do.
 

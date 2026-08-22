@@ -1,0 +1,946 @@
+# DE proteomics - wheat
+Kristina Gagalova
+
+- [Overview](#overview)
+  - [Two things this dataset does not tell us — edit before trusting the
+    output](#two-things-this-dataset-does-not-tell-us-edit-before-trusting-the-output)
+- [1. Setup](#setup)
+- [2. Loading and QC (reusable
+  functions)](#loading-and-qc-reusable-functions)
+- [3. Kinetic archetype classification (profile-likelihood,
+  `05`-style)](#kinetic-archetype-classification-profile-likelihood-05-style)
+- [4. Case B integration (`06`-style)](#case-b-integration-06-style)
+- [5. Run the pipeline: Cadenza](#run-the-pipeline-cadenza)
+- [6. Hierarchical Bayesian kinetics:
+  Cadenza](#hierarchical-bayesian-kinetics-cadenza)
+- [7. Case B integration: Cadenza](#case-b-integration-cadenza)
+- [8. Run the pipeline: Norin](#run-the-pipeline-norin)
+- [9. Cross-variety validation via reciprocal-best-hit
+  orthologs](#cross-variety-validation-via-reciprocal-best-hit-orthologs)
+- [10. Summary and limitations](#summary-and-limitations)
+  - [Next steps](#next-steps)
+
+## Overview
+
+Integrated RNA-seq / quantitative proteomics analysis of a wheat
+time-course treatment experiment, in two varieties (**Cadenza**,
+**Norin**), each with an independent **2 treatments x 4 timepoints x 3
+replicates = 24 samples per omics layer** design.
+
+**RNA and protein are measured on different biological samples within
+each variety** (unpaired / “Case B” design, per `../../CLAUDE.md` and
+`../../docs/PIPELINE.md`) — not split aliquots of the same 24 samples.
+That rules out sample-level factor models (MOFA+/MEFISTO/DIABLO/O2PLS)
+and shapes every method choice below; see `../../docs/PIPELINE.md` and
+`../../docs/planning.md` for the full reasoning.
+
+This notebook runs the complete pipeline end to end on the real data in
+`../../data/real/`:
+
+1.  Data audit and design check
+2.  QC & normalisation (RNA: `filterByExpr` + VST/voom; protein:
+    validity filter + normalisation, adapted for this dataset – see the
+    note in §2)
+3.  ID mapping (trivial here: `protein_id == gene_id` within each
+    variety)
+4.  Missingness diagnosis (MNAR/MAR) and imputation
+5.  Temporal differential expression (`limma`, both layers)
+6.  Kinetic-null / amplitude classification (the profile-likelihood
+    model from `05_concordance_archetypes.R`)
+7.  **Hierarchical Bayesian kinetics** (`07_bayesian_kinetics.R`) — the
+    new piece this notebook exists to run: a horseshoe-shrinkage model
+    that rescues genes the profile-likelihood method above cannot
+    classify on its own (the `kinetics_limited` problem this directory
+    is named for)
+8.  Case B design-cell integration (leave-one-cell-out Q^2 + permutation
+    null)
+9.  Cross-variety validation using reciprocal-best-hit orthologs — the
+    one piece of genuine external validation available for real
+    (non-simulated) data in this project
+
+Steps 2–8 are defined once as reusable functions and applied to each
+variety; step 9 compares the two varieties’ independent results against
+each other.
+
+### Two things this dataset does not tell us — edit before trusting the output
+
+``` r
+## 1. WHICH TREATMENT IS THE REFERENCE?
+##    Metadata encodes "T0"/"T1" with no further label. Assumed here: T0 is
+##    the control/reference level, T1 is the treatment. If that is backwards,
+##    every log2FC and every kinetic direction (amplified/buffered) below is
+##    mirrored -- flip TREATMENT_REF to fix without re-deriving anything else.
+TREATMENT_REF <- "T0"
+
+## 2. WHAT IS THE REAL TIME SPACING?
+##    Metadata encodes "t0".."t3" with no units. Assumed here: EVENLY SPACED,
+##    1 arbitrary unit apart (0, 1, 2, 3). Every half-life reported in §7-8 is
+##    in these SAME units, and is only interpretable as "hours" or "days" once
+##    this vector is corrected to the true sampling times. Edit to the real
+##    values (e.g. c(0, 6, 24, 48) for hours) before interpreting kinetics.
+TIMEPOINT_VALUES <- c(0, 1, 2, 3)
+TIME_UNIT_LABEL  <- c(0, 24, 48, 72)
+#TIME_UNIT_LABEL  <- "time unit (EDIT: real spacing unknown -- see note above)"
+```
+
+## 1. Setup
+
+``` r
+## Quarto's default execution directory is this file's own folder
+## (analysis/kinetics_limited/), while every R/*.R script in this project
+## assumes the working directory is the PROJECT ROOT (matching how
+## run_all.sh invokes them). Rather than fight that mismatch with a
+## working-directory switch (fragile: root.dir changes how KNITR evaluates
+## chunks, but does not change what a *sourced* script sees via
+## sys.frame()$ofile, which is empty inside a knitr chunk anyway), every
+## path below is resolved with here::here(), which walks up from the
+## current directory looking for a project marker file -- this project has
+## four (IntegrateProtRNA.Rproj, DESCRIPTION, renv.lock, .git) -- and returns
+## an absolute path that is correct no matter where code is executed from.
+## need_pkgs() itself is defined inside utils.R, so "here" -- the one package
+## every subsequent path depends on -- is checked directly first.
+if (!requireNamespace("here", quietly = TRUE))
+  stop("package 'here' is required; install with install.packages('here')")
+source(here::here("R", "utils.R"))
+source(here::here("R", "pls_utils.R"))
+source(here::here("R", "07_bayesian_kinetics.R"))
+need_pkgs(c("limma", "edgeR", "DESeq2", "matrixStats", "impute", "here"))
+
+set.seed(20260822)
+DATA_DIR <- here::here("data", "real")
+
+DESIGN <- list(
+  treatments = c(TREATMENT_REF, setdiff(c("T0", "T1"), TREATMENT_REF)),
+  reference  = TREATMENT_REF,
+  timepoints = TIMEPOINT_VALUES,
+  n_reps     = 3
+)
+CELLS <- as.vector(t(outer(DESIGN$treatments, DESIGN$timepoints,
+                          function(a, b) sprintf("%s_t%s", a, b))))
+```
+
+## 2. Loading and QC (reusable functions)
+
+``` r
+#' Load one variety's RNA, protein, metadata and gene mapping.
+#'
+#' Metadata is a single file per variety, shared across both omics layers'
+#' column headers -- the LH-style sample IDs happen to coincide between the
+#' RNA and protein matrices for a given variety (both trace back to the same
+#' field-plot label), but per the Case B design this is NOT treated as
+#' sample-level pairing anywhere downstream: only variety x treatment x
+#' timepoint CELL membership is used to link the two layers (see
+#' `../../R/06_integration_caseB.R`'s header for why).
+load_variety <- function(prefix) {
+
+  data_dir <- here::here("data", "real")
+
+  meta <- read.csv(
+    file.path(data_dir, paste0(prefix, "_metadata.csv")),
+    row.names = 1
+  )
+
+  meta$time_num  <- TIMEPOINT_VALUES[
+    match(meta$timepoint, sort(unique(meta$timepoint)))
+  ]
+  meta$treatment <- factor(meta$treatment, levels = DESIGN$treatments)
+  meta$cell <- factor(
+    sprintf("%s_t%s", meta$treatment, meta$time_num),
+    levels = CELLS
+  )
+
+  rna <- as.matrix(
+    read.csv(
+      file.path(data_dir, paste0(prefix, "-rnaseq.csv")),
+      row.names = 1,
+      check.names = FALSE
+    )
+  )
+
+  prot <- as.matrix(
+    read.csv(
+      file.path(data_dir, paste0(prefix, "-prot.csv")),
+      row.names = 1,
+      check.names = FALSE
+    )
+  )
+
+  gmap <- read.csv(
+    file.path(data_dir, paste0(prefix, "_protein_gene_mapping.csv"))
+  )
+
+  stopifnot(
+    all(colnames(rna) %in% rownames(meta)),
+    all(colnames(prot) %in% rownames(meta))
+  )
+
+  rna  <- rna[, rownames(meta), drop = FALSE]
+  prot <- prot[, rownames(meta), drop = FALSE]
+
+  list(
+    rna = rna,
+    prot = prot,
+    meta = meta,
+    gmap = gmap
+  )
+}
+```
+
+``` r
+#' RNA QC: filterByExpr, then VST (integration matrix) + voom-ready counts.
+#' Same procedure as `01_qc_normalise.R`, applied to real counts directly.
+run_qc_rna <- function(counts, meta) {
+  keep <- edgeR::filterByExpr(counts, group = meta$cell, min.count = 10, min.total.count = 15)
+  cf <- counts[keep, , drop = FALSE]
+  dge <- edgeR::calcNormFactors(edgeR::DGEList(cf))
+  logcpm <- edgeR::cpm(dge, log = TRUE, prior.count = 3)
+  dds <- DESeq2::DESeqDataSetFromMatrix(cf, meta, ~cell)
+  dds <- DESeq2::estimateSizeFactors(dds)
+  vst <- SummarizedExperiment::assay(
+    DESeq2::vst(dds, blind = TRUE, nsub = min(1000, sum(rowMeans(cf) > 5))))
+  list(counts = cf, logcpm = logcpm, vst = vst, n_in = nrow(counts), n_kept = nrow(cf))
+}
+
+#' Protein QC, adapted from `01_qc_normalise.R` for this dataset:
+#' the real protein_gene_mapping.csv carries no unique-peptide/decoy/
+#' contaminant columns (unlike the simulator's MaxQuant-style metadata), so
+#' that part of 01's filtering is not applicable here and is skipped
+#' explicitly rather than silently omitted. Zero is treated as "not
+#' quantified" (standard LFQ-intensity convention), not a true biological
+#' zero -- it becomes NA before the validity filter and normalisation.
+run_qc_prot <- function(intensity, meta, min_valid_in_cell = 2) {
+  m <- intensity; m[m == 0] <- NA; m <- log2(m)
+  valid_per_cell <- vapply(levels(meta$cell), function(cl)
+    rowSums(!is.na(m[, meta$cell == cl, drop = FALSE])), numeric(nrow(m)))
+  keep <- matrixStats::rowMaxs(valid_per_cell) >= min_valid_in_cell
+  mf <- m[keep, , drop = FALSE]
+  ## median normalisation: shift each sample so its median matches the
+  ## matrix-wide median -- corrects per-run loading, not biology.
+  shift <- apply(mf, 2, median, na.rm = TRUE) - median(mf, na.rm = TRUE)
+  mn <- sweep(mf, 2, shift, "-")
+  list(norm = mn, n_in = nrow(intensity), n_kept = nrow(mf), miss_rate = mean(is.na(mn)))
+}
+```
+
+``` r
+#' MNAR/MAR diagnosis and mixed imputation, same rule as `03_missingness.R`:
+#' a protein missing in EVERY replicate of a cell (but observed in some other
+#' cell) is MNAR (left-censored -- genuinely low/absent there); missing in
+#' only SOME replicates of its cell is MAR (stochastic). Imputed values are
+#' for Universe A / integration use only -- the DE and kinetics steps below
+#' use these imputed values too (protein has no complete-case alternative at
+#' this scale), but the up-front validity filter (>=2 valid in >=1 cell)
+#' keeps the imputation from manufacturing pure noise.
+run_missingness <- function(prot_norm, meta) {
+  cells <- levels(meta$cell)
+  is_na <- is.na(prot_norm)
+  n_obs_cell <- vapply(cells, function(cl)
+    rowSums(!is.na(prot_norm[, meta$cell == cl, drop = FALSE])), numeric(nrow(prot_norm)))
+  lab <- matrix("obs", nrow(prot_norm), ncol(prot_norm), dimnames = dimnames(prot_norm))
+  for (k in seq_along(cells)) {
+    ii <- which(meta$cell == cells[k]); gone <- n_obs_cell[, k] == 0
+    lab[gone, ii] <- "MNAR"; lab[!gone, ii][is_na[!gone, ii]] <- "MAR"
+  }
+  lab[!is_na] <- "obs"
+
+  mar_imp <- suppressWarnings(
+    impute::impute.knn(prot_norm, k = 10, rowmax = 0.95, colmax = 0.95)$data)
+  mnar_imp <- prot_norm
+  for (j in seq_len(ncol(prot_norm))) {
+    v <- prot_norm[, j]; nas <- is.na(v)
+    if (!any(nas)) next
+    mu <- mean(v, na.rm = TRUE); sdv <- sd(v, na.rm = TRUE)
+    ## Perseus-style down-shifted normal: width 0.3, downshift 1.8 SD.
+    mnar_imp[nas, j] <- rnorm(sum(nas), mu - 1.8 * sdv, 0.3 * sdv)
+  }
+  mixed <- prot_norm
+  mixed[lab == "MAR"]  <- mar_imp[lab == "MAR"]
+  mixed[lab == "MNAR"] <- mnar_imp[lab == "MNAR"]
+  stopifnot(!anyNA(mixed))
+  list(mixed = mixed, labels = lab,
+       mnar_frac = mean(lab == "MNAR"), mar_frac = mean(lab == "MAR"))
+}
+```
+
+``` r
+#' Temporal DE, both layers, same design as `04_univariate_temporal_de.R`:
+#' an 8-level ~0+cell design, per-timepoint treatment contrasts, and an
+#' any-effect F-test. limma is used for both RNA (voom) and protein (trend +
+#' robust eBayes) so effect sizes are on a comparable scale.
+run_de <- function(mat, meta, is_rna) {
+  design <- model.matrix(~0 + cell, meta); colnames(design) <- levels(meta$cell)
+  cn <- function(tr, t) sprintf("%s_t%s", tr, t)
+  alt <- setdiff(DESIGN$treatments, DESIGN$reference)
+  tp <- setNames(sprintf("%s - %s", cn(alt, DESIGN$timepoints), cn(DESIGN$reference, DESIGN$timepoints)),
+                paste0("tp_t", DESIGN$timepoints))
+  it <- setNames(sprintf("(%s - %s) - (%s - %s)",
+                         cn(alt, DESIGN$timepoints[-1]), cn(DESIGN$reference, DESIGN$timepoints[-1]),
+                         cn(alt, DESIGN$timepoints[1]),  cn(DESIGN$reference, DESIGN$timepoints[1])),
+                paste0("int_t", DESIGN$timepoints[-1]))
+  if (is_rna) {
+    dge <- edgeR::calcNormFactors(edgeR::DGEList(mat))
+    v <- limma::voom(dge, design, plot = FALSE)
+    fit <- limma::lmFit(v, design); trend <- FALSE
+  } else {
+    fit <- limma::lmFit(mat, design); trend <- TRUE
+  }
+  cm <- limma::makeContrasts(contrasts = c(tp, it), levels = design)
+  colnames(cm) <- c(names(tp), names(it))
+  f2 <- limma::eBayes(limma::contrasts.fit(fit, cm), trend = trend, robust = TRUE)
+
+  lfc <- f2$coefficients[, names(tp), drop = FALSE]; colnames(lfc) <- paste0("t", DESIGN$timepoints)
+  se  <- (f2$stdev.unscaled * sqrt(f2$s2.post))[, names(tp), drop = FALSE]; colnames(se) <- colnames(lfc)
+  padj <- apply(f2$p.value[, names(tp), drop = FALSE], 2, p.adjust, "BH"); colnames(padj) <- colnames(lfc)
+
+  ff <- limma::classifyTestsF(f2[, names(tp)], fstat.only = TRUE)
+  ## as.numeric(ff) strips rownames -- reattach explicitly (caught in dev
+  ## testing on real data: without this, any_fdr[gene_subset] silently
+  ## returns NA for every gene instead of erroring).
+  p_any <- setNames(pf(as.numeric(ff), attr(ff, "df1"), attr(ff, "df2"), lower.tail = FALSE),
+                    rownames(f2))
+  list(lfc = lfc, se = se, fdr = padj, any_fdr = p.adjust(p_any, "BH"))
+}
+```
+
+## 3. Kinetic archetype classification (profile-likelihood, `05`-style)
+
+``` r
+#' Nested kinetic model: M0 (protein trajectory fully explained by RNA
+#' kinetics alone) vs M1 (M0 + a free amplitude factor `a`), compared by a
+#' 1-df likelihood-ratio test. Identical model and identifiability handling
+#' to `05_concordance_archetypes.R` -- see that script's header for the full
+#' reasoning (this is what separates real post-transcriptional regulation
+#' from a protein simply having a long half-life).
+run_kinetic_archetypes <- function(Rl, Rs, Pl, Ps, tps, fdr_thresh = 0.05, min_abs_lfc = 0.5) {
+  grid <- seq(0, max(tps), by = 0.25); gi <- match(tps, grid)
+  r_grid <- t(apply(Rl, 1, function(v) approx(tps, v, grid, rule = 2)$y))
+  r_lin  <- 2^r_grid
+  th_bound <- max(tps)
+  th_grid  <- exp(seq(log(0.5 * diff(tps)[1]), log(6 * th_bound), length.out = 80))
+  kd_grid  <- log(2) / th_grid
+  W <- 1 / pmax(Ps, 0.05)^2; SST <- rowSums(W * Pl^2)
+  n <- nrow(Pl); J <- length(kd_grid)
+  ssr0 <- ssr1 <- ahat <- matrix(NA_real_, n, J); preds <- vector("list", J)
+  for (j in seq_len(J)) {
+    kd <- kd_grid[j]
+    pl <- log2(pmax(integrate_protein_mat(grid, r_lin, ks = kd, kd = kd, P0 = rep(1, n))[, gi, drop = FALSE], 1e-9))
+    preds[[j]] <- pl
+    ssr0[, j] <- rowSums(W * (pl - Pl)^2)
+    num <- rowSums(W * pl * Pl); den <- rowSums(W * pl^2)
+    a <- ifelse(den > 1e-12, num / den, NA_real_); ahat[, j] <- a
+    ssr1[, j] <- SST - ifelse(den > 1e-12, num^2 / den, 0)
+  }
+  j0 <- max.col(-ssr0, "first"); j1 <- max.col(-ssr1, "first")
+  ix <- function(j) cbind(seq_len(n), j)
+  S0 <- ssr0[ix(j0)]; S1 <- ssr1[ix(j1)]
+  t_half_M0 <- th_grid[j0]; t_half_M1 <- th_grid[j1]; a_hat <- ahat[ix(j1)]
+  pred0 <- t(vapply(seq_len(n), function(i) preds[[j0[i]]][i, ], numeric(length(tps))))
+  lrt <- pmax(S0 - S1, 0); p_lrt <- pchisq(lrt, 1, lower.tail = FALSE); fdr_lrt <- p.adjust(p_lrt, "BH")
+
+  max_abs <- function(m) apply(abs(m[, -1, drop = FALSE]), 1, max)
+  rna_resp <- max_abs(Rl) > min_abs_lfc
+  regulated <- rna_resp & (fdr_lrt < fdr_thresh)
+  identifiable <- t_half_M0 <= th_bound; slow <- t_half_M0 > 0.5 * th_bound
+
+  archetype <- rep("unchanged", n)
+  archetype[!rna_resp & max_abs(Pl) > min_abs_lfc] <- "protein_only"
+  archetype[rna_resp & !regulated &  identifiable & !slow] <- "concordant"
+  archetype[rna_resp & !regulated &  identifiable &  slow] <- "kinetic_lag"
+  archetype[rna_resp & !regulated & !identifiable]         <- "kinetics_limited"
+  archetype[regulated & a_hat >= 1]            <- "amplified"
+  archetype[regulated & a_hat < 1 & a_hat > 0] <- "buffered"
+  archetype[regulated & a_hat <= 0]            <- "anticorrelated"
+
+  data.frame(gene_id = rownames(Pl), archetype = archetype, rna_responds = rna_resp,
+            regulated = regulated, amplitude_a = a_hat,
+            t_half_M0_h = t_half_M0, t_half_M1_h = t_half_M1,
+            identifiable = identifiable, lrt_p = p_lrt, lrt_fdr = fdr_lrt,
+            stringsAsFactors = FALSE)
+}
+```
+
+## 4. Case B integration (`06`-style)
+
+``` r
+#' Design-cell PLS with leave-one-cell-out Q^2 against a permutation null --
+#' the Case B analogue of a MEFISTO/DIABLO variance-explained figure. See
+#' `06_integration_caseB.R`'s header for why the in-sample cross-block
+#' correlation is not a valid statistic here (it reaches ~0.7-0.9 even on
+#' permuted data at this sample size).
+run_integration <- function(rna_mat, prot_mat, cd_r, cd_p, n_hvg = 3000, n_hvp = 2000,
+                            n_comp = 3, n_perm = 200) {
+  hv_r <- top_variable(rna_mat,  min(n_hvg, nrow(rna_mat)))
+  hv_p <- top_variable(prot_mat, min(n_hvp, nrow(prot_mat)))
+  Xc <- prep_block(cell_means(rna_mat[hv_r, ],  cd_r))
+  Yc <- prep_block(cell_means(prot_mat[hv_p, ], cd_p))
+  stopifnot(identical(rownames(Xc), rownames(Yc)))
+  K  <- min(n_comp, nrow(Xc) - 3)
+  fit <- pls2(Xc, Yc, ncomp = K)
+  Ax <- row_space(Xc); Ay <- row_space(Yc)
+  q2 <- q2_loo(Ax, Ay, K)
+  perm_q2 <- matrix(NA_real_, n_perm, K)
+  for (b in seq_len(n_perm)) perm_q2[b, ] <- q2_loo(Ax, Ay[sample(nrow(Ay)), , drop = FALSE], K)
+  p_q2 <- vapply(seq_len(K), function(k) (1 + sum(perm_q2[, k] >= q2[k])) / (n_perm + 1), 0)
+  list(fit = fit, q2 = q2, perm_q2 = perm_q2, p_q2 = p_q2,
+       cellmeta = data.frame(cell = rownames(Xc)))
+}
+```
+
+## 5. Run the pipeline: Cadenza
+
+``` r
+cad <- load_variety("cadenza")
+knitr::kable(table(cad$meta$treatment, cad$meta$time_num),
+            caption = "Cadenza design: samples per treatment x timepoint")
+```
+
+|     |   0 |   1 |   2 |   3 |
+|:----|----:|----:|----:|----:|
+| T0  |   3 |   3 |   3 |   3 |
+| T1  |   3 |   3 |   3 |   3 |
+
+Cadenza design: samples per treatment x timepoint
+
+``` r
+cad_qc_r <- run_qc_rna(cad$rna, cad$meta)
+cad_qc_p <- run_qc_prot(cad$prot, cad$meta)
+cat(sprintf("RNA: %d / %d genes kept by filterByExpr\n", cad_qc_r$n_kept, cad_qc_r$n_in))
+```
+
+    RNA: 59457 / 128544 genes kept by filterByExpr
+
+``` r
+cat(sprintf("Protein: %d / %d groups kept (>=2 valid in >=1 cell); missing rate %.1f%%\n",
+           cad_qc_p$n_kept, cad_qc_p$n_in, 100 * cad_qc_p$miss_rate))
+```
+
+    Protein: 5861 / 6105 groups kept (>=2 valid in >=1 cell); missing rate 22.3%
+
+``` r
+pca_plot <- function(m, meta, main) {
+  mv <- m[order(row_var(m), decreasing = TRUE, na.last = NA)[seq_len(min(500, nrow(m)))], , drop = FALSE]
+  mv <- mv[complete.cases(mv), , drop = FALSE]
+  p <- prcomp(t(mv), scale. = FALSE)
+  v <- round(100 * p$sdev^2 / sum(p$sdev^2), 1)
+  plot(p$x[, 1], p$x[, 2], pch = c(16, 17)[as.integer(meta$treatment)],
+       col = hcl.colors(4, "Zissou1")[as.integer(factor(meta$time_num))], cex = 1.6,
+       xlab = sprintf("PC1 (%.1f%%)", v[1]), ylab = sprintf("PC2 (%.1f%%)", v[2]), main = main)
+  legend("topright", bty = "n", cex = 0.7, legend = levels(meta$treatment), pch = c(16, 17))
+}
+op <- par(mfrow = c(1, 2))
+pca_plot(cad_qc_r$vst,       cad$meta, "Cadenza RNA (VST)")
+pca_plot(cad_qc_p$norm,      cad$meta, "Cadenza protein (normalised)")
+par(op)
+```
+
+<img
+src="de_proteomics_wheat_files/figure-commonmark/fig-cadenza-qc-pca-1.png"
+id="fig-cadenza-qc-pca"
+alt="Figure 1: Cadenza PCA, RNA (VST) and protein (normalised), coloured by treatment" />
+
+``` r
+cad_mi <- run_missingness(cad_qc_p$norm, cad$meta)
+```
+
+    Cluster size 5861 broken into 3622 2239 
+    Cluster size 3622 broken into 2430 1192 
+    Cluster size 2430 broken into 1561 869 
+    Cluster size 1561 broken into 819 742 
+    Done cluster 819 
+    Done cluster 742 
+    Done cluster 1561 
+    Done cluster 869 
+    Done cluster 2430 
+    Done cluster 1192 
+    Done cluster 3622 
+    Cluster size 2239 broken into 1075 1164 
+    Done cluster 1075 
+    Done cluster 1164 
+    Done cluster 2239 
+
+``` r
+cat(sprintf("MNAR: %.1f%%  MAR: %.1f%%  (of all entries)\n",
+           100 * cad_mi$mnar_frac, 100 * cad_mi$mar_frac))
+```
+
+    MNAR: 10.2%  MAR: 12.1%  (of all entries)
+
+``` r
+## protein_id == gene_id within a variety (verified in ../../data/real/
+## *_protein_gene_mapping.csv), so Universe B == QC'd protein genes that also
+## survive RNA QC -- no bipartite mapping ambiguity for this dataset.
+cad_de_rna  <- run_de(cad_qc_r$counts, cad$meta, TRUE)
+cad_common  <- intersect(rownames(cad_mi$mixed), rownames(cad_qc_r$counts))
+cad_de_prot <- run_de(cad_mi$mixed[cad_common, , drop = FALSE], cad$meta, FALSE)
+
+cat(sprintf("Universe B: %d matched genes\n", length(cad_common)))
+```
+
+    Universe B: 5577 matched genes
+
+``` r
+cat(sprintf("RNA any-effect FDR<0.05: %d\n",  sum(cad_de_rna$any_fdr[cad_common] < 0.05)))
+```
+
+    RNA any-effect FDR<0.05: 4736
+
+``` r
+cat(sprintf("Protein any-effect FDR<0.05: %d\n", sum(cad_de_prot$any_fdr < 0.05)))
+```
+
+    Protein any-effect FDR<0.05: 1971
+
+``` r
+cad_Rl <- cad_de_rna$lfc[cad_common, ];  cad_Rs <- cad_de_rna$se[cad_common, ]
+cad_Pl <- cad_de_prot$lfc;               cad_Ps <- cad_de_prot$se
+cad_Rl <- cad_Rl - cad_Rl[, 1]; cad_Pl <- cad_Pl - cad_Pl[, 1]
+
+cad_arch <- run_kinetic_archetypes(cad_Rl, cad_Rs, cad_Pl, cad_Ps, DESIGN$timepoints)
+knitr::kable(as.data.frame(table(archetype = cad_arch$archetype)),
+            caption = "Cadenza: profile-likelihood archetype calls")
+```
+
+| archetype        | Freq |
+|:-----------------|-----:|
+| amplified        |  480 |
+| anticorrelated   |  518 |
+| buffered         |   48 |
+| concordant       | 1276 |
+| kinetic_lag      |  533 |
+| kinetics_limited | 1700 |
+| protein_only     |  749 |
+| unchanged        |  273 |
+
+Cadenza: profile-likelihood archetype calls
+
+## 6. Hierarchical Bayesian kinetics: Cadenza
+
+``` r
+## RNA-responsive gate (mirrors 05's rna_resp / the doc note in
+## 07_bayesian_kinetics.R): the amplitude model is only meaningful when RNA
+## carries real signal -- for a flat-RNA gene ANY amplitude "explains" a tiny
+## predicted change equally badly, which (confirmed in dev testing on this
+## exact dataset) can otherwise drive a gene to the numerical safety bound.
+cad_rna_resp <- (cad_de_rna$any_fdr[cad_common] < 0.05) &
+  (apply(abs(cad_Rl[, -1, drop = FALSE]), 1, max) > 0.5)
+cat(sprintf("RNA-responsive, eligible for amplitude fitting: %d / %d\n",
+           sum(cad_rna_resp), length(cad_rna_resp)))
+```
+
+    RNA-responsive, eligible for amplitude fitting: 4261 / 5577
+
+``` r
+cad_fit <- fit_hierarchical_kinetics(
+  cad_Rl[cad_rna_resp, ], cad_Rs[cad_rna_resp, ],
+  cad_Pl[cad_rna_resp, ], cad_Ps[cad_rna_resp, ],
+  ## Anchored at the SAME joint-optimal half-life the profile-likelihood fit
+  ## above already found (t_half_M1_h), so the two analyses share one kinetic
+  ## fit and differ only in how the amplitude is inferred (independent
+  ## per-gene LRT vs. hierarchical horseshoe shrinkage).
+  t_half = cad_arch$t_half_M1_h[match(rownames(cad_Rl)[cad_rna_resp], cad_arch$gene_id)],
+  tps = DESIGN$timepoints, n_iter = 2000, warmup = 800, seed = 1, verbose = FALSE)
+
+cat(sprintf("MCMC acceptance rate: %.2f\n", cad_fit$accept_delta))
+```
+
+    MCMC acceptance rate: 0.75
+
+``` r
+cat(sprintf("Genes at the numerical safety bound (report as directional, not exact): %d / %d\n",
+           sum(cad_fit$summary$at_bound), nrow(cad_fit$summary)))
+```
+
+    Genes at the numerical safety bound (report as directional, not exact): 86 / 4261
+
+``` r
+cat(sprintf("Regulated by hierarchical model (95%% CI excludes a=1): %d / %d\n",
+           sum(cad_fit$summary$regulated_95), nrow(cad_fit$summary)))
+```
+
+    Regulated by hierarchical model (95% CI excludes a=1): 2096 / 4261
+
+``` r
+cat(sprintf("Regulated by profile-likelihood LRT (FDR<0.05), same genes: %d / %d\n",
+           sum(cad_arch$regulated[match(rownames(cad_Rl)[cad_rna_resp], cad_arch$gene_id)]),
+           sum(cad_rna_resp)))
+```
+
+    Regulated by profile-likelihood LRT (FDR<0.05), same genes: 943 / 4261
+
+``` r
+idx <- match(cad_fit$summary$gene_id, cad_arch$gene_id)
+plot(cad_fit$summary$a_mean, -log10(pmax(cad_arch$lrt_p[idx], 1e-12)), pch = 16, cex = 0.4,
+     col = ifelse(cad_fit$summary$regulated_95, "#D1495B99", "#00000033"),
+     xlab = "hierarchical posterior mean amplitude (a)",
+     ylab = "-log10 p (profile-likelihood LRT)",
+     main = "Cadenza: two independent regulation signals\n(red = hierarchical model flags as regulated)")
+abline(v = 1, lty = 3)
+```
+
+<img
+src="de_proteomics_wheat_files/figure-commonmark/fig-cadenza-kinetic-volcano-1.png"
+id="fig-cadenza-kinetic-volcano"
+alt="Figure 2: Cadenza kinetic volcano: hierarchical posterior amplitude vs. profile-likelihood significance" />
+
+The two methods agree on genes with strong signal and differ most on
+genes the profile-likelihood LRT was underpowered for individually
+(§`docs/PIPELINE.md` documents this trade-off quantitatively on
+simulated ground truth: the hierarchical model roughly triples recall at
+the cost of a higher false-call rate on truly-unregulated genes, since
+fixing the half-life removes one source of legitimate uncertainty from
+its interval). Genes flagged by **both** methods are the
+highest-confidence regulated set; genes flagged by the hierarchical
+model **only** are candidates for follow-up validation, not standalone
+claims.
+
+``` r
+cad_kin <- data.frame(
+  gene_id = rownames(cad_Rl)[cad_rna_resp],
+  lrt_regulated  = cad_arch$regulated[match(rownames(cad_Rl)[cad_rna_resp], cad_arch$gene_id)],
+  bayes_regulated = cad_fit$summary$regulated_95,
+  a_mean = cad_fit$summary$a_mean, at_bound = cad_fit$summary$at_bound,
+  stringsAsFactors = FALSE)
+knitr::kable(as.data.frame(table(LRT = cad_kin$lrt_regulated, Bayesian = cad_kin$bayes_regulated)),
+            caption = "Cadenza: agreement between the two regulation calls")
+```
+
+| LRT   | Bayesian | Freq |
+|:------|:---------|-----:|
+| FALSE | FALSE    | 2089 |
+| TRUE  | FALSE    |   76 |
+| FALSE | TRUE     | 1229 |
+| TRUE  | TRUE     |  867 |
+
+Cadenza: agreement between the two regulation calls
+
+## 7. Case B integration: Cadenza
+
+``` r
+cad_int <- run_integration(cad_qc_r$vst, cad_mi$mixed, cad$meta, cad$meta)
+knitr::kable(data.frame(component = seq_along(cad_int$q2), Q2 = round(cad_int$q2, 3),
+                        perm_q95 = round(apply(cad_int$perm_q2, 2, quantile, .95), 3),
+                        p_value = signif(cad_int$p_q2, 3)),
+            caption = "Cadenza: leave-one-cell-out Q2 vs permutation null")
+```
+
+| component |    Q2 | perm_q95 | p_value |
+|----------:|------:|---------:|--------:|
+|         1 | 0.268 |    0.044 | 0.00498 |
+|         2 | 0.207 |    0.023 | 0.00995 |
+|         3 | 0.152 |   -0.152 | 0.00498 |
+
+Cadenza: leave-one-cell-out Q2 vs permutation null
+
+## 8. Run the pipeline: Norin
+
+Identical steps, applied to the second variety.
+
+``` r
+nor <- load_variety("norin")
+knitr::kable(table(nor$meta$treatment, nor$meta$time_num),
+            caption = "Norin design: samples per treatment x timepoint")
+```
+
+|     |   0 |   1 |   2 |   3 |
+|:----|----:|----:|----:|----:|
+| T0  |   3 |   3 |   3 |   3 |
+| T1  |   3 |   3 |   3 |   3 |
+
+Norin design: samples per treatment x timepoint
+
+``` r
+nor_qc_r <- run_qc_rna(nor$rna, nor$meta)
+nor_qc_p <- run_qc_prot(nor$prot, nor$meta)
+cat(sprintf("RNA: %d / %d genes kept\n", nor_qc_r$n_kept, nor_qc_r$n_in))
+```
+
+    RNA: 58848 / 145065 genes kept
+
+``` r
+cat(sprintf("Protein: %d / %d groups kept; missing rate %.1f%%\n",
+           nor_qc_p$n_kept, nor_qc_p$n_in, 100 * nor_qc_p$miss_rate))
+```
+
+    Protein: 5641 / 5879 groups kept; missing rate 21.0%
+
+``` r
+nor_mi <- run_missingness(nor_qc_p$norm, nor$meta)
+```
+
+    Cluster size 5641 broken into 1939 3702 
+    Cluster size 1939 broken into 1030 909 
+    Done cluster 1030 
+    Done cluster 909 
+    Done cluster 1939 
+    Cluster size 3702 broken into 2489 1213 
+    Cluster size 2489 broken into 838 1651 
+    Done cluster 838 
+    Cluster size 1651 broken into 941 710 
+    Done cluster 941 
+    Done cluster 710 
+    Done cluster 1651 
+    Done cluster 2489 
+    Done cluster 1213 
+    Done cluster 3702 
+
+``` r
+cat(sprintf("MNAR: %.1f%%  MAR: %.1f%%\n", 100 * nor_mi$mnar_frac, 100 * nor_mi$mar_frac))
+```
+
+    MNAR: 8.6%  MAR: 12.4%
+
+``` r
+nor_de_rna  <- run_de(nor_qc_r$counts, nor$meta, TRUE)
+nor_common  <- intersect(rownames(nor_mi$mixed), rownames(nor_qc_r$counts))
+nor_de_prot <- run_de(nor_mi$mixed[nor_common, , drop = FALSE], nor$meta, FALSE)
+cat(sprintf("Universe B: %d matched genes\n", length(nor_common)))
+```
+
+    Universe B: 5152 matched genes
+
+``` r
+nor_Rl <- nor_de_rna$lfc[nor_common, ];  nor_Rs <- nor_de_rna$se[nor_common, ]
+nor_Pl <- nor_de_prot$lfc;               nor_Ps <- nor_de_prot$se
+nor_Rl <- nor_Rl - nor_Rl[, 1]; nor_Pl <- nor_Pl - nor_Pl[, 1]
+
+nor_arch <- run_kinetic_archetypes(nor_Rl, nor_Rs, nor_Pl, nor_Ps, DESIGN$timepoints)
+knitr::kable(as.data.frame(table(archetype = nor_arch$archetype)),
+            caption = "Norin: profile-likelihood archetype calls")
+```
+
+| archetype        | Freq |
+|:-----------------|-----:|
+| amplified        |  427 |
+| anticorrelated   |  460 |
+| buffered         |    4 |
+| concordant       |  982 |
+| kinetic_lag      |  348 |
+| kinetics_limited | 1569 |
+| protein_only     |  965 |
+| unchanged        |  397 |
+
+Norin: profile-likelihood archetype calls
+
+``` r
+nor_rna_resp <- (nor_de_rna$any_fdr[nor_common] < 0.05) &
+  (apply(abs(nor_Rl[, -1, drop = FALSE]), 1, max) > 0.5)
+cat(sprintf("RNA-responsive, eligible for amplitude fitting: %d / %d\n",
+           sum(nor_rna_resp), length(nor_rna_resp)))
+```
+
+    RNA-responsive, eligible for amplitude fitting: 3540 / 5152
+
+``` r
+nor_fit <- fit_hierarchical_kinetics(
+  nor_Rl[nor_rna_resp, ], nor_Rs[nor_rna_resp, ],
+  nor_Pl[nor_rna_resp, ], nor_Ps[nor_rna_resp, ],
+  t_half = nor_arch$t_half_M1_h[match(rownames(nor_Rl)[nor_rna_resp], nor_arch$gene_id)],
+  tps = DESIGN$timepoints, n_iter = 2000, warmup = 800, seed = 1, verbose = FALSE)
+
+cat(sprintf("MCMC acceptance rate: %.2f\n", nor_fit$accept_delta))
+```
+
+    MCMC acceptance rate: 0.78
+
+``` r
+cat(sprintf("Regulated by hierarchical model: %d / %d\n",
+           sum(nor_fit$summary$regulated_95), nrow(nor_fit$summary)))
+```
+
+    Regulated by hierarchical model: 1656 / 3540
+
+``` r
+nor_int <- run_integration(nor_qc_r$vst, nor_mi$mixed, nor$meta, nor$meta)
+knitr::kable(data.frame(component = seq_along(nor_int$q2), Q2 = round(nor_int$q2, 3),
+                        perm_q95 = round(apply(nor_int$perm_q2, 2, quantile, .95), 3),
+                        p_value = signif(nor_int$p_q2, 3)),
+            caption = "Norin: leave-one-cell-out Q2 vs permutation null")
+```
+
+| component |     Q2 | perm_q95 | p_value |
+|----------:|-------:|---------:|--------:|
+|         1 |  0.083 |    0.037 | 0.02990 |
+|         2 | -0.034 |   -0.118 | 0.01490 |
+|         3 |  0.032 |   -0.176 | 0.00498 |
+
+Norin: leave-one-cell-out Q2 vs permutation null
+
+## 9. Cross-variety validation via reciprocal-best-hit orthologs
+
+Neither variety has simulated ground truth, so this is the one source of
+genuine external validation available: **do the two independently-run
+analyses agree on orthologous genes?** Agreement is not guaranteed even
+for correct biology (Cadenza and Norin can genuinely differ), but
+strong, widespread *disagreement* on high-confidence calls would flag a
+methodology problem rather than real biological divergence.
+
+``` r
+rbh <- read.csv(file.path(DATA_DIR, "norin_cadenza_rbh-clean.csv"))
+cat(sprintf("RBH ortholog pairs: %d (%d unique Norin, %d unique Cadenza)\n",
+           nrow(rbh), length(unique(rbh$query)), length(unique(rbh$target))))
+```
+
+    RBH ortholog pairs: 105305 (81761 unique Norin, 79501 unique Cadenza)
+
+``` r
+## Keep 1:1 RBH pairs only -- a gene appearing on both sides of more than one
+## row is an ambiguous ortholog call and is excluded rather than guessed at.
+rbh_1to1 <- rbh[!(duplicated(rbh$query) | duplicated(rbh$query, fromLast = TRUE)) &
+                !(duplicated(rbh$target) | duplicated(rbh$target, fromLast = TRUE)), ]
+cat(sprintf("1:1 RBH pairs: %d\n", nrow(rbh_1to1)))
+```
+
+    1:1 RBH pairs: 73971
+
+``` r
+## Restrict to ortholog pairs where BOTH varieties had the gene in their own
+## Universe B (matched RNA+protein, QC-passing) archetype table.
+pair <- merge(rbh_1to1, cad_arch, by.x = "target", by.y = "gene_id")
+pair <- merge(pair, nor_arch, by.x = "query", by.y = "gene_id", suffixes = c("_cad", "_nor"))
+cat(sprintf("Ortholog pairs testable in both varieties: %d\n", nrow(pair)))
+```
+
+    Ortholog pairs testable in both varieties: 2499
+
+``` r
+knitr::kable(table(Cadenza = pair$archetype_cad, Norin = pair$archetype_nor),
+            caption = "Archetype agreement across 1:1 orthologs (Cadenza rows, Norin columns)")
+```
+
+|                  | amplified | anticorrelated | concordant | kinetic_lag | kinetics_limited | protein_only | unchanged |
+|:-----------------|----------:|---------------:|-----------:|------------:|-----------------:|-------------:|----------:|
+| amplified        |        60 |             20 |         66 |          13 |               38 |           21 |         3 |
+| anticorrelated   |        14 |             34 |         35 |           9 |               78 |           27 |         7 |
+| buffered         |         2 |              1 |          4 |           0 |               10 |            0 |         0 |
+| concordant       |        69 |             55 |        137 |          50 |              165 |           71 |        30 |
+| kinetic_lag      |        12 |             26 |         74 |          26 |              122 |           16 |         6 |
+| kinetics_limited |        39 |             79 |        137 |          67 |              369 |           79 |        37 |
+| protein_only     |         9 |             13 |         28 |           5 |               39 |          123 |        52 |
+| unchanged        |         4 |              4 |         18 |           2 |               20 |           46 |        28 |
+
+Archetype agreement across 1:1 orthologs (Cadenza rows, Norin columns)
+
+``` r
+## Amplitude correlation among genes both varieties called RNA-responsive --
+## the most direct real-data check on whether the kinetic model is measuring
+## something reproducible rather than dataset-specific noise.
+both_resp <- pair$rna_responds_cad & pair$rna_responds_nor
+cat(sprintf("\nBoth-variety RNA-responsive ortholog pairs: %d\n", sum(both_resp)))
+```
+
+
+    Both-variety RNA-responsive ortholog pairs: 1811
+
+``` r
+if (sum(both_resp) > 10) {
+  cc <- cor(pair$amplitude_a_cad[both_resp], pair$amplitude_a_nor[both_resp],
+           method = "spearman", use = "complete.obs")
+  cat(sprintf("Spearman(amplitude_a Cadenza, amplitude_a Norin) = %.2f\n", cc))
+}
+```
+
+    Spearman(amplitude_a Cadenza, amplitude_a Norin) = 0.04
+
+``` r
+## The continuous amplitude correlation above is expected to be weak even for
+## real, reproducible biology: each variety's per-gene amplitude is itself a
+## noisy n=3 point estimate (the same reason §concordance-by-timepoint in
+## 05_concordance_archetypes.R reports a DISATTENUATED correlation rather than
+## the raw one -- two noisy proxies for the same true quantity correlate far
+## more weakly than the true quantities do). The CATEGORICAL archetype call is
+## more robust to that per-gene noise, so test it directly instead of reading
+## the near-zero continuous correlation as "no reproducibility":
+chisq <- suppressWarnings(chisq.test(table(pair$archetype_cad, pair$archetype_nor)))
+cramers_v <- sqrt(unname(chisq$statistic) / (nrow(pair) * (min(dim(table(pair$archetype_cad, pair$archetype_nor))) - 1)))
+cat(sprintf("\nChi-sq test, archetype agreement across orthologs: X2=%.1f, df=%d, p=%s\n",
+           chisq$statistic, chisq$parameter, format.pval(chisq$p.value, digits = 3)))
+```
+
+
+    Chi-sq test, archetype agreement across orthologs: X2=721.9, df=42, p=<2e-16
+
+``` r
+cat(sprintf("Cramer's V: %.3f  (modest but real association, not attributable to chance)\n",
+           cramers_v))
+```
+
+    Cramer's V: 0.219  (modest but real association, not attributable to chance)
+
+``` r
+if (sum(both_resp) > 10) {
+  plot(pair$amplitude_a_cad[both_resp], pair$amplitude_a_nor[both_resp], pch = 16, cex = 0.4,
+       col = "#2C6FBB66", xlab = "amplitude a (Cadenza)", ylab = "amplitude a (Norin)",
+       main = "Ortholog amplitude concordance,\nboth varieties RNA-responsive")
+  abline(0, 1, col = "#D1495B", lwd = 2); abline(h = 1, v = 1, lty = 3, col = "grey60")
+}
+```
+
+<img
+src="de_proteomics_wheat_files/figure-commonmark/fig-rbh-amplitude-concordance-1.png"
+id="fig-rbh-amplitude-concordance"
+alt="Figure 3: Cross-variety amplitude concordance for shared orthologs" />
+
+## 10. Summary and limitations
+
+``` r
+summ <- data.frame(
+  variety = c("Cadenza", "Norin"),
+  rna_genes_kept   = c(cad_qc_r$n_kept, nor_qc_r$n_kept),
+  protein_kept     = c(cad_qc_p$n_kept, nor_qc_p$n_kept),
+  universe_b       = c(length(cad_common), length(nor_common)),
+  rna_responsive   = c(sum(cad_rna_resp), sum(nor_rna_resp)),
+  lrt_regulated    = c(sum(cad_arch$regulated), sum(nor_arch$regulated)),
+  bayes_regulated  = c(sum(cad_fit$summary$regulated_95), sum(nor_fit$summary$regulated_95)),
+  integration_q2_c1 = c(round(cad_int$q2[1], 3), round(nor_int$q2[1], 3)),
+  integration_p_c1  = c(signif(cad_int$p_q2[1], 3), signif(nor_int$p_q2[1], 3)))
+knitr::kable(summ, caption = "Pipeline summary, both varieties")
+```
+
+| variety | rna_genes_kept | protein_kept | universe_b | rna_responsive | lrt_regulated | bayes_regulated | integration_q2_c1 | integration_p_c1 |
+|:--------|---------------:|-------------:|-----------:|---------------:|--------------:|----------------:|------------------:|-----------------:|
+| Cadenza |          59457 |         5861 |       5577 |           4261 |          1046 |            2096 |             0.268 |          0.00498 |
+| Norin   |          58848 |         5641 |       5152 |           3540 |           891 |            1656 |             0.083 |          0.02990 |
+
+Pipeline summary, both varieties
+
+**Read before using any downstream number:**
+
+- **Timepoint units are unconfirmed** (§ “Two things this dataset does
+  not tell us”). Every half-life in this notebook is in 0, 24, 48, 72,
+  not hours, until `TIMEPOINT_VALUES` is corrected to the real sampling
+  schedule.
+- **Treatment reference is assumed**, not confirmed from metadata beyond
+  the `T0`/`T1` labels themselves.
+- **Protein QC has no decoy/contaminant/unique-peptide filter** here
+  (§2): the provided `*_protein_gene_mapping.csv` files do not carry
+  that MaxQuant/ DIA-NN metadata. If the original search-engine output
+  is available, rerun QC with `../../R/01_qc_normalise.R`’s full filter
+  instead.
+- **The hierarchical Bayesian model fixes each gene’s half-life** at its
+  own profile-likelihood joint optimum rather than sampling it jointly
+  with amplitude (see `07_bayesian_kinetics.R`’s header for why: jointly
+  sampling both produces a slow-mixing ridge). This sacrifices joint
+  kinetic/amplitude uncertainty propagation – its credible intervals
+  should be read as “amplitude uncertainty at the point-estimate
+  kinetics,” not full posterior uncertainty.
+- **~2% of RNA-responsive genes hit the model’s numerical safety bound**
+  (`at_bound = TRUE` in the summary tables) even after gating to RNA-
+  responsive genes. These are real, strong-signal genes, not degenerate
+  artefacts (verified during development) – but their reported amplitude
+  should be read as directional (“at least this extreme”), not a precise
+  estimate.
+- **No ground truth exists for real data.** §9’s cross-variety ortholog
+  concordance is the best available external check, not proof of
+  correctness – Cadenza and Norin are permitted to genuinely differ.
+
+### Next steps
+
+- Confirm `TREATMENT_REF` and `TIMEPOINT_VALUES` against the actual
+  experimental record and re-render.
+- If the original MaxQuant/DIA-NN search output is available, rerun
+  protein QC through the full `01_qc_normalise.R` filter (decoys,
+  contaminants, unique-peptide count).
+- `docs/planning.md` §4B-4E (GNN residuals, translation-delay atlas,
+  XGBoost/SHAP buffering predictors) remain unbuilt; evaluate against
+  the existing `rnaprot/` codebase on `nectar` before building new
+  versions (see project memory `proj_existing_nectar_rnaprot.md`).

@@ -1,0 +1,32 @@
+Package: IntegrateProtRNA
+Title: RNA-Protein Multi-Omics Integration Pipeline (Case B)
+Version: 0.1.0
+Description: R pipeline for integrating RNA-seq and quantitative proteomics
+    from an unpaired (Case B) time-course design. Not an installable R
+    package -- this DESCRIPTION file exists only to drive renv's "explicit"
+    dependency snapshot (renv.lock), listing exactly the packages the
+    pipeline in R/ and analysis/ actually requires, rather than renv
+    auto-scanning every package mentioned anywhere (including optional
+    fallbacks documented in env/install_r_deps.R).
+Imports:
+    BiocManager,
+    DESeq2,
+    edgeR,
+    igraph,
+    impute,
+    knitr,
+    limma,
+    matrixStats,
+    yaml
+Suggests:
+    ComplexHeatmap,
+    imputeLCMD,
+    missForest,
+    mixOmics,
+    MOFA2,
+    OmicsPLS,
+    preprocessCore,
+    rmarkdown,
+    vsn
+License: MIT
+Encoding: UTF-8
