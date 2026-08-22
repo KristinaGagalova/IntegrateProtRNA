@@ -1,0 +1,7 @@
+metric	value
+rna_genes_in	4000
+rna_genes_kept	4000
+prot_groups_in	1897
+prot_groups_kept	1645
+prot_missing_rate	0.216
+prot_norm	median

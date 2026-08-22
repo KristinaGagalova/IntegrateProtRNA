@@ -1,0 +1,14 @@
+# Local Claude Code session management (this machine only)
+.claude/
+claudesession.bat
+unused/
+
+# Session transcripts and project instructions containing real
+# server hostnames/IPs/key paths -- not part of the analysis code
+CLAUDE.md
+docs/full_session_transcripts.md
+
+# R
+.Rhistory
+.Rproj.user/
+*.Rproj

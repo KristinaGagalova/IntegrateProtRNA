@@ -1,0 +1,108 @@
+# IntegrateProtRNA - pipeline configuration
+# Case B design: RNA and protein measured on DIFFERENT biological samples
+# drawn from the same population/design. Shared dimension = design cell.
+
+project:
+  name: IntegrateProtRNA
+  seed: 20260821
+  case: B            # A = sample-matched, B = unmatched (this study)
+
+design:
+  timepoints: [0, 6, 24, 48]      # hours; must be numeric and ordered
+  time_unit: "h"
+  treatments: ["Ctrl", "Trt"]
+  reference_treatment: "Ctrl"
+  n_reps: 3
+  # 2 treatments x 4 timepoints x 3 reps = 24 samples PER OMICS LAYER
+
+paths:
+  data_raw:   "data/raw"
+  data_sim:   "data/simulated"
+  results:    "results"
+  figures:    "figures"
+
+simulate:
+  n_genes: 4000
+  # archetype proportions must sum to 1
+  archetype_props:
+    unchanged:      0.60
+    concordant:     0.12
+    buffered:       0.08
+    mrna_only:      0.06
+    protein_only:   0.06
+    anticorrelated: 0.04
+    lag_only:       0.04
+  rna_lib_size: 20000000
+  rna_dispersion_a0: 0.02       # dispersion = a0 + a1/mu
+  rna_dispersion_a1: 3.0
+  prot_noise_sd: 0.35           # log2 units
+  prot_mnar_midpoint_q: 0.18    # quantile of intensity at 50% MNAR probability
+  prot_mnar_slope: 1.2
+  prot_mar_rate: 0.04
+  # deliberate ID-mapping mess injected into the simulated data
+  frac_gene_multi_group: 0.05   # one gene -> several protein groups
+  frac_shared_peptide_groups: 0.04  # protein group -> several genes
+  frac_rna_only: 0.55           # genes with no protein evidence at all
+
+qc:
+  rna_min_count: 10
+  rna_min_samples: 3
+  prot_min_unique_peptides: 2
+  prot_min_valid_in_a_group: 2  # "at least n valid values in >=1 design cell"
+  prot_normalisation: "median"  # median | vsn | quantile
+  prot_input_is_log2: true      # set false if you supply raw MS intensities
+
+missingness:
+  # imputation is applied to Universe A only; Universe B analyses use observed values
+  mnar_method: "QRILC"          # QRILC | MinProb | downshift
+  mar_method: "knn"             # knn | missForest
+  downshift_sd: 1.8
+  downshift_width: 0.3
+  sensitivity_schemes: ["mixed", "downshift", "complete_case"]
+
+de:
+  fdr: 0.05
+  lfc_threshold: 0.0
+  # limma design uses ~0 + cell, cell = treatment_time (8 levels)
+
+concordance:
+  min_abs_lfc: 0.5              # effect-size floor for archetype calls
+  sig_fdr: 0.05
+  n_boot: 2000                  # bootstrap over replicates
+  delay_grid: [0, 1, 2, 4, 6, 9, 12, 18, 24, 36]   # hours, for lag estimation
+  # Optional external half-life prior (gene_id, t_half_h[, sd_log]). Leave empty
+  # to run uninformed. This is the single most effective way to shrink the
+  # attenuation-vs-turnover unidentifiable region -- see 05 header.
+  half_life_prior_file: "data/simulated/half_life_prior.tsv"
+
+integration:
+  n_hvg_rna: 3000
+  n_hvp_prot: 2000
+  mofa_factors: 5
+  mofa_seeds: 10
+  n_boot_cells: 200             # replicate-bootstrap of design-cell means
+  o2pls_nc: 2
+  o2pls_nx: 1
+  o2pls_ny: 1
+  rep_pairing_B: 500            # exchangeable replicate-pairing bootstrap
+
+clusters:
+  ncomp: 2
+  max_k: 8
+
+kinetics:
+  n_genes_fit: 1500             # subset of Universe B genes for the Bayesian ODE
+  svi_steps: 4000
+  mcmc_warmup: 500
+  mcmc_samples: 500
+  mcmc_chains: 4
+
+ml:
+  gnn_hidden: 64
+  gnn_heads: 4
+  gnn_layers: 2
+  gnn_dropout: 0.4
+  gnn_epochs: 400
+  mask_frac: 0.20
+  n_seeds: 20
+  string_score_min: 700

@@ -1,0 +1,7 @@
+metric	value
+spearman_intensity_vs_missing	-0.8695
+n_obs	30941
+n_MAR	6514
+n_MNAR	2025
+missing_rate	0.2163
+complete_case_proteins	188
