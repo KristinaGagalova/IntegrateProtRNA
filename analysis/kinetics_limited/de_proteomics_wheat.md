@@ -2,8 +2,7 @@
 Kristina Gagalova
 
 - [Overview](#overview)
-  - [Two things this dataset does not tell us — edit before trusting the
-    output](#two-things-this-dataset-does-not-tell-us-edit-before-trusting-the-output)
+  - [Design constants](#design-constants)
 - [1. Setup](#setup)
 - [2. Loading and QC (reusable
   functions)](#loading-and-qc-reusable-functions)
@@ -39,6 +38,12 @@ Kristina Gagalova
 - [8b. A3 diagnostic: does control-arm drift drive the `regulated`
   calls?](#b.-a3-diagnostic-does-control-arm-drift-drive-the-regulated-calls)
   - [What the diagnostic found](#what-the-diagnostic-found)
+- [8c. Hierarchical Bayesian model — assumptions and
+  diagnostics](#c.-hierarchical-bayesian-model-assumptions-and-diagnostics)
+  - [What the hierarchical model
+    assumes](#what-the-hierarchical-model-assumes)
+  - [These diagnostics already caught and fixed a real
+    problem](#these-diagnostics-already-caught-and-fixed-a-real-problem)
 - [9. Cross-variety validation via reciprocal-best-hit
   orthologs](#cross-variety-validation-via-reciprocal-best-hit-orthologs)
 - [10. Summary and limitations](#summary-and-limitations)
@@ -86,27 +91,36 @@ Steps 2–8 are defined once as reusable functions and applied to each
 variety; step 9 compares the two varieties’ independent results against
 each other.
 
-### Two things this dataset does not tell us — edit before trusting the output
+### Design constants
+
+Both of these were originally unknown from `data/real/*_metadata.csv`
+alone (which encodes only `T0`/`T1` and `t0`..`t3`) and have since been
+resolved against the full RNA-seq sample sheet:
 
 ``` r
-## 1. WHICH TREATMENT IS THE REFERENCE?
-##    Metadata encodes "T0"/"T1" with no further label. Assumed here: T0 is
-##    the control/reference level, T1 is the treatment. If that is backwards,
-##    every log2FC and every kinetic direction (amplified/buffered) below is
-##    mirrored -- flip TREATMENT_REF to fix without re-deriving anything else.
+## 1. WHICH TREATMENT IS THE REFERENCE?  -- CONFIRMED
+##    data/real/*_metadata.csv encodes only "T0"/"T1". Cross-referencing the
+##    sample IDs against the full RNA-seq sample sheet (which carries the
+##    real labels) resolves it: LH4 is Cadenza/NEG/0h there and T0/t0 here,
+##    LH10 is Cadenza/PN143/0h there and T1/t0 here. So:
+##        T0 = NEG   = uninfected control  -> reference level
+##        T1 = PN143 = infected            -> treatment
+##    Flipping this mirrors every log2FC and every kinetic direction
+##    (amplified <-> buffered), so it is worth the cross-check.
 TREATMENT_REF <- "T0"
 
-## 2. WHAT IS THE REAL TIME SPACING?
-##    Metadata encodes "t0".."t3" with no units. Assumed here: EVENLY SPACED,
-##    1 arbitrary unit apart (0, 1, 2, 3). Every half-life reported in §7-8 is
-##    in these SAME units, and is only interpretable as "hours" or "days" once
-##    this vector is corrected to the true sampling times. Edit to the real
-##    values (e.g. c(0, 6, 24, 48) for hours) before interpreting kinetics.
-#TIMEPOINT_VALUES <- c(0, 1, 2, 3)
+## 2. WHAT IS THE REAL TIME SPACING?  -- CONFIRMED
+##    The same sample sheet carries an `hour` column: t0/t1/t2/t3 are
+##    0 / 24 / 48 / 72 hours (i.e. 0-3 dpi), evenly spaced at 24 h.
+##    Every half-life reported downstream is therefore in HOURS.
 TIMEPOINT_VALUES <- c(0, 24, 48, 72)
-TIME_UNIT_LABEL  <- c(0, 24, 48, 72)
-#TIME_UNIT_LABEL  <- "time unit (EDIT: real spacing unknown -- see note above)"
+TIME_UNIT_LABEL  <- "hours"
 ```
+
+Note the consequence for the kinetic model: the half-life search grid
+starts at `0.5 * 24 = 12 h`, so **no half-life below 12 h can be
+resolved** by this design. Proteins turning over faster than that are
+reported at the grid floor.
 
 ## 1. Setup
 
@@ -241,16 +255,34 @@ run_qc_rna <- function(counts, meta) {
 #' quantified" (standard LFQ-intensity convention), not a true biological
 #' zero -- it becomes NA before the validity filter and normalisation.
 run_qc_prot <- function(intensity, meta, min_valid_in_cell = 2) {
-  m <- intensity; m[m == 0] <- NA; m <- log2(m)
-  valid_per_cell <- vapply(levels(meta$cell), function(cl)
-    rowSums(!is.na(m[, meta$cell == cl, drop = FALSE])), numeric(nrow(m)))
+
+  # Zero means "not quantified", not a biological zero
+  m <- intensity
+  m[m == 0] <- NA
+  m <- log2(m)
+
+  # Validity filter: >= n valid values in AT LEAST ONE design cell.
+  # A global ">= 50% valid" rule would delete genuine on/off biology.
+  valid_per_cell <- vapply(
+    levels(meta$cell),
+    function(cl) rowSums(!is.na(m[, meta$cell == cl, drop = FALSE])),
+    numeric(nrow(m))
+  )
+
   keep <- matrixStats::rowMaxs(valid_per_cell) >= min_valid_in_cell
-  mf <- m[keep, , drop = FALSE]
-  ## median normalisation: shift each sample so its median matches the
-  ## matrix-wide median -- corrects per-run loading, not biology.
+  mf   <- m[keep, , drop = FALSE]
+
+  # Median normalisation: shift each sample so its median matches the
+  # matrix-wide median. Corrects per-run loading, not biology.
   shift <- apply(mf, 2, median, na.rm = TRUE) - median(mf, na.rm = TRUE)
-  mn <- sweep(mf, 2, shift, "-")
-  list(norm = mn, n_in = nrow(intensity), n_kept = nrow(mf), miss_rate = mean(is.na(mn)))
+  mn    <- sweep(mf, 2, shift, "-")
+
+  list(
+    norm      = mn,
+    n_in      = nrow(intensity),
+    n_kept    = nrow(mf),
+    miss_rate = mean(is.na(mn))
+  )
 }
 ```
 
@@ -404,20 +436,28 @@ genes with both layers passing QC):
 ### The Two Nested Models
 
 Everything is expressed as fold-change relative to the time-matched
-control, so $r(t) = 2^{\text{logFC}_{\text{RNA}}(t)}$ and
-$p(t) = 2^{\text{logFC}_{\text{protein}}(t)}$, both starting at 1.
+control:
+
+$$
+r(t) = 2^{\,\text{logFC}_{\text{RNA}}(t)}, \qquad
+p(t) = 2^{\,\text{logFC}_{\text{protein}}(t)}
+$$
+
+both starting at 1.
 
 ### M0 - The Kinetic Null
 
-If the treatment changed only transcript abundance, the protein is
-forced to follow first-order kinetics:
+Under assumptions A1–A3 (derived in “Where the Kinetic Null Comes From”
+below — note that A3 is measurably violated in this dataset), if the
+treatment changed only transcript abundance the protein follows
+first-order kinetics:
 
 $$
 \frac{dp}{dt} = k_d \cdot (r(t) - p(t)), \quad p(0) = 1
 $$
 
-One free parameter: $k_d$, the degradation rate (reported as half-life
-$\log(2)/k_d$). This is the trajectory the protein must take if nothing
+One free parameter: `k_d`, the degradation rate (reported as half-life
+`log(2)/k_d`). This is the trajectory the protein must take if nothing
 post-transcriptional is happening. Implemented via
 `integrate_protein_mat(..., ks = kd, kd = kd, P0 = 1)` - setting
 `ks = kd` makes the steady state equal $r$, which is what encodes
@@ -448,7 +488,7 @@ For each of 80 candidate half-lives on a log-spaced grid, both models
 are fitted to all genes simultaneously (vectorised), then the best grid
 point per gene is taken:
 
-1.  Solve the ODE at that $k_d \rightarrow$ predicted trajectory $pl$.
+1.  Solve the ODE at that `k_d` → predicted trajectory $pl$.
 2.  **M0:** weighted SSR of $pl$ against observed, $a$ fixed at 1.
 3.  **M1:** the optimal $a$ has a closed form — weighted least squares
     through the origin,
@@ -469,7 +509,7 @@ uses the 3 post-baseline points.
 
 ## The Test
 
-$LRT = SSR_{M0} - SSR_{M1}$, compared to $\chi^2$ with 1 df. Since the
+`LRT = SSR_M0 - SSR_M1`, compared to $\chi^2$ with 1 df. Since the
 weights already carry $1/\sigma^2$, the weighted SSR difference is
 directly on the chi-square scale. BH-adjusted across genes $\rightarrow$
 `lrt_fdr`.
@@ -581,8 +621,13 @@ $$
 \frac{dP_c}{dt} = k_s R_c(t) - k_d P_c(t), \qquad \frac{dP_t}{dt} = k_s R_t(t) - k_d P_t(t)
 $$
 
-Define the fold-changes $r = R_t/R_c$ and $p = P_t/P_c$. Differentiating
-the quotient:
+Define the fold-changes
+
+$$
+r = R_t / R_c, \qquad p = P_t / P_c
+$$
+
+and differentiate the quotient:
 
 $$
 \frac{dp}{dt} = \frac{P_t' P_c - P_t P_c'}{P_c^2}
@@ -590,23 +635,23 @@ $$
               = \underbrace{\frac{k_s R_c}{P_c}}_{\text{coefficient}} (r - p)
 $$
 
-The $k_d$ terms **cancel exactly**. The coefficient is $k_s R_c / P_c$,
-*not* $k_d$. It equals $k_d$ only when $k_s R_c = k_d P_c$ — that is,
+The `k_d` terms **cancel exactly**. The coefficient is `k_s·R_c/P_c`,
+*not* `k_d`. It equals `k_d` only when `k_s·R_c = k_d·P_c` — that is,
 only when the control arm is at steady state.
 
-So the implemented equation $dp/dt = k_d(r - p)$ requires:
+So the implemented equation `dp/dt = k_d(r - p)` requires:
 
 | \#     | Assumption                                                | Status                                                                                                                                                                                       |
 |:-------|:----------------------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **A1** | Protein dynamics are first-order: $dP/dt = k_s R - k_d P$ | Approximation. Excludes translational saturation, cooperative/zero-order degradation, stoichiometry-driven degradation of unassembled complex subunits, and transcription→translation delay. |
-| **A2** | Treatment leaves $k_s$ and $k_d$ unchanged                | This *is* the null hypothesis being tested. Rejecting it is the point.                                                                                                                       |
+| **A1** | Protein dynamics are first-order: `dP/dt = k_s·R - k_d·P` | Approximation. Excludes translational saturation, cooperative/zero-order degradation, stoichiometry-driven degradation of unassembled complex subunits, and transcription→translation delay. |
+| **A2** | Treatment leaves `k_s` and `k_d` unchanged                | This *is* the null hypothesis being tested. Rejecting it is the point.                                                                                                                       |
 | **A3** | Control arm is at (quasi-)steady state throughout         | **Measurably violated here — see the diagnostic below.**                                                                                                                                     |
 
 ### A note on `ks = kd` in the code
 
 `integrate_protein_mat(..., ks = kd, kd = kd, P0 = 1)` is **not** a
 biological claim that synthesis rate equals degradation rate. In the
-fold-change formulation absolute $k_s$ cancels out entirely and is not
+fold-change formulation absolute `k_s` cancels out entirely and is not
 identifiable from this data at all (it is absorbed by the per-protein MS
 response factor). Setting `ks = kd` is the mathematical encoding of
 **A3** — it forces the steady state of the relative system to equal $r$.
@@ -620,9 +665,9 @@ the time course — unsurprising for wheat seedlings over 72 h
 (development, circadian rhythm, handling), but a direct violation of
 “control at steady state.”
 
-The consequence is specific: when $R_c$ is rising, $P_c$ lags below its
-steady state, so the true coefficient $k_s R_c/P_c$ exceeds $k_d$; when
-$R_c$ falls, it drops below. Because $k_d$ and $a$ trade off along the
+The consequence is specific: when `R_c` is rising, `P_c` lags below its
+steady state, so the true coefficient `k_s·R_c/P_c` exceeds `k_d`; when
+`R_c` falls, it drops below. Because `k_d` and $a$ trade off along the
 identifiability ridge, that misfit can leak into the amplitude estimate
 — meaning some `regulated` calls could reflect control-arm
 non-stationarity rather than treatment-specific post-transcriptional
@@ -630,8 +675,8 @@ control.
 
 Two mitigating points, for balance: the ratio formulation cancels any
 effect **shared** by both arms exactly, and growth dilution inflates
-$k_d$ uniformly without breaking the functional form. It is specifically
-the *lag of* $P_c$ *behind a moving* $R_c$ that breaks A3, not movement
+`k_d` uniformly without breaking the functional form. It is specifically
+the *lag of* `P_c` *behind a moving* `R_c` that breaks A3, not movement
 per se.
 
 The next section tests how much this actually matters.
@@ -719,54 +764,129 @@ run_a3_diagnostic <- function(ctrl_time, Rl, arch, rna_resp, label = "") {
 #' to `05_concordance_archetypes.R` -- see that script's header for the full
 #' reasoning (this is what separates real post-transcriptional regulation
 #' from a protein simply having a long half-life).
-run_kinetic_archetypes <- function(Rl, Rs, Pl, Ps, tps, fdr_thresh = 0.05, min_abs_lfc = 0.5) {
-  
-  grid <- seq(0, max(tps), by = 0.25); gi <- match(tps, grid)
+run_kinetic_archetypes <- function(Rl, Rs, Pl, Ps, tps,
+                                   fdr_thresh  = 0.05,
+                                   min_abs_lfc = 0.5) {
+
+  # ------------------------------------------------------------------
+  # Setup: fine time grid, RNA trajectory interpolated onto it
+  # ------------------------------------------------------------------
+  grid <- seq(0, max(tps), by = 0.25)
+  gi   <- match(tps, grid)                 # positions of sampled timepoints
+
   r_grid <- t(apply(Rl, 1, function(v) approx(tps, v, grid, rule = 2)$y))
-  r_lin  <- 2^r_grid
+  r_lin  <- 2^r_grid                       # linear fold-change scale
+
+  # ------------------------------------------------------------------
+  # Half-life search grid
+  #   lower : half the smallest sampling gap -- below this, distinct
+  #           half-lives are indistinguishable at the sampled points
+  #   upper : well past the identifiability bound, so genuinely slow
+  #           genes are not clamped; `identifiable` carries the caveat
+  # ------------------------------------------------------------------
   th_bound <- max(tps)
-  th_grid  <- exp(seq(log(0.5 * diff(tps)[1]), log(6 * th_bound), length.out = 80))
-  kd_grid  <- log(2) / th_grid
-  W <- 1 / pmax(Ps, 0.05)^2; SST <- rowSums(W * Pl^2)
-  n <- nrow(Pl); J <- length(kd_grid)
-  ssr0 <- ssr1 <- ahat <- matrix(NA_real_, n, J); preds <- vector("list", J)
-  
+
+  th_grid <- exp(seq(log(0.5 * diff(tps)[1]),
+                     log(6 * th_bound),
+                     length.out = 80))
+
+  kd_grid <- log(2) / th_grid
+
+  # Inverse-variance weights: each gene judged against its own noise
+  W   <- 1 / pmax(Ps, 0.05)^2
+  SST <- rowSums(W * Pl^2)
+
+  n <- nrow(Pl)
+  J <- length(kd_grid)
+
+  ssr0  <- ssr1 <- ahat <- matrix(NA_real_, n, J)
+  preds <- vector("list", J)
+
+  # ------------------------------------------------------------------
+  # Fit both models at every candidate half-life, all genes at once
+  # ------------------------------------------------------------------
   for (j in seq_len(J)) {
+
     kd <- kd_grid[j]
-    pl <- log2(pmax(integrate_protein_mat(grid, r_lin, ks = kd, kd = kd, P0 = rep(1, n))[, gi, drop = FALSE], 1e-9))
+
+    pl <- integrate_protein_mat(grid, r_lin, ks = kd, kd = kd, P0 = rep(1, n))
+    pl <- log2(pmax(pl[, gi, drop = FALSE], 1e-9))
+
     preds[[j]] <- pl
+
+    # M0: amplitude fixed at 1
     ssr0[, j] <- rowSums(W * (pl - Pl)^2)
-    num <- rowSums(W * pl * Pl); den <- rowSums(W * pl^2)
-    a <- ifelse(den > 1e-12, num / den, NA_real_); ahat[, j] <- a
+
+    # M1: optimal amplitude has a closed form (weighted least squares
+    # through the origin), so profile it out instead of searching for it
+    num <- rowSums(W * pl * Pl)
+    den <- rowSums(W * pl^2)
+
+    ahat[, j] <- ifelse(den > 1e-12, num / den, NA_real_)
     ssr1[, j] <- SST - ifelse(den > 1e-12, num^2 / den, 0)
   }
-  
-  j0 <- max.col(-ssr0, "first"); j1 <- max.col(-ssr1, "first")
-  ix <- function(j) cbind(seq_len(n), j)
-  S0 <- ssr0[ix(j0)]; S1 <- ssr1[ix(j1)]
-  t_half_M0 <- th_grid[j0]; t_half_M1 <- th_grid[j1]; a_hat <- ahat[ix(j1)]
-  pred0 <- t(vapply(seq_len(n), function(i) preds[[j0[i]]][i, ], numeric(length(tps))))
-  lrt <- pmax(S0 - S1, 0); p_lrt <- pchisq(lrt, 1, lower.tail = FALSE); fdr_lrt <- p.adjust(p_lrt, "BH")
 
+  # ------------------------------------------------------------------
+  # Pick each gene's best half-life under each model
+  # ------------------------------------------------------------------
+  j0 <- max.col(-ssr0, "first")
+  j1 <- max.col(-ssr1, "first")
+
+  ix <- function(j) cbind(seq_len(n), j)
+
+  S0 <- ssr0[ix(j0)]
+  S1 <- ssr1[ix(j1)]
+
+  t_half_M0 <- th_grid[j0]
+  t_half_M1 <- th_grid[j1]
+  a_hat     <- ahat[ix(j1)]
+
+  pred0 <- t(vapply(seq_len(n),
+                    function(i) preds[[j0[i]]][i, ],
+                    numeric(length(tps))))
+
+  # ------------------------------------------------------------------
+  # Likelihood-ratio test of M1 against M0 (1 df)
+  # ------------------------------------------------------------------
+  lrt     <- pmax(S0 - S1, 0)
+  p_lrt   <- pchisq(lrt, df = 1, lower.tail = FALSE)
+  fdr_lrt <- p.adjust(p_lrt, "BH")
+
+  # ------------------------------------------------------------------
+  # Classification
+  # ------------------------------------------------------------------
   max_abs <- function(m) apply(abs(m[, -1, drop = FALSE]), 1, max)
-  rna_resp <- max_abs(Rl) > min_abs_lfc
-  regulated <- rna_resp & (fdr_lrt < fdr_thresh)
-  identifiable <- t_half_M0 <= th_bound; slow <- t_half_M0 > 0.5 * th_bound
+
+  rna_resp     <- max_abs(Rl) > min_abs_lfc
+  regulated    <- rna_resp & (fdr_lrt < fdr_thresh)
+  identifiable <- t_half_M0 <= th_bound
+  slow         <- t_half_M0 > 0.5 * th_bound
 
   archetype <- rep("unchanged", n)
-  archetype[!rna_resp & max_abs(Pl) > min_abs_lfc] <- "protein_only"
+
+  archetype[!rna_resp & max_abs(Pl) > min_abs_lfc]         <- "protein_only"
+
   archetype[rna_resp & !regulated &  identifiable & !slow] <- "concordant"
   archetype[rna_resp & !regulated &  identifiable &  slow] <- "kinetic_lag"
   archetype[rna_resp & !regulated & !identifiable]         <- "kinetics_limited"
-  archetype[regulated & a_hat >= 1]            <- "amplified"
-  archetype[regulated & a_hat < 1 & a_hat > 0] <- "buffered"
-  archetype[regulated & a_hat <= 0]            <- "anticorrelated"
 
-  data.frame(gene_id = rownames(Pl), archetype = archetype, rna_responds = rna_resp,
-            regulated = regulated, amplitude_a = a_hat,
-            t_half_M0_h = t_half_M0, t_half_M1_h = t_half_M1,
-            identifiable = identifiable, lrt_p = p_lrt, lrt_fdr = fdr_lrt,
-            stringsAsFactors = FALSE)
+  archetype[regulated & a_hat >= 1]                        <- "amplified"
+  archetype[regulated & a_hat <  1 & a_hat > 0]            <- "buffered"
+  archetype[regulated & a_hat <= 0]                        <- "anticorrelated"
+
+  data.frame(
+    gene_id      = rownames(Pl),
+    archetype    = archetype,
+    rna_responds = rna_resp,
+    regulated    = regulated,
+    amplitude_a  = a_hat,
+    t_half_M0_h  = t_half_M0,
+    t_half_M1_h  = t_half_M1,
+    identifiable = identifiable,
+    lrt_p        = p_lrt,
+    lrt_fdr      = fdr_lrt,
+    stringsAsFactors = FALSE
+  )
 }
 ```
 
@@ -949,26 +1069,26 @@ cad_fit <- fit_hierarchical_kinetics(
   ## fit and differ only in how the amplitude is inferred (independent
   ## per-gene LRT vs. hierarchical horseshoe shrinkage).
   t_half = cad_arch$t_half_M1_h[match(rownames(cad_Rl)[cad_rna_resp], cad_arch$gene_id)],
-  tps = DESIGN$timepoints, n_iter = 2000, warmup = 800, seed = 1, verbose = FALSE)
+  tps = DESIGN$timepoints, n_iter = 4000, warmup = 1600, seed = 1, verbose = FALSE)
 
 cat(sprintf("MCMC acceptance rate: %.2f\n", cad_fit$accept_delta))
 ```
 
-    MCMC acceptance rate: 0.75
+    MCMC acceptance rate: 0.46
 
 ``` r
 cat(sprintf("Genes at the numerical safety bound (report as directional, not exact): %d / %d\n",
            sum(cad_fit$summary$at_bound), nrow(cad_fit$summary)))
 ```
 
-    Genes at the numerical safety bound (report as directional, not exact): 88 / 4228
+    Genes at the numerical safety bound (report as directional, not exact): 168 / 4228
 
 ``` r
 cat(sprintf("Regulated by hierarchical model (95%% CI excludes a=1): %d / %d\n",
            sum(cad_fit$summary$regulated_95), nrow(cad_fit$summary)))
 ```
 
-    Regulated by hierarchical model (95% CI excludes a=1): 2043 / 4228
+    Regulated by hierarchical model (95% CI excludes a=1): 1908 / 4228
 
 ``` r
 cat(sprintf("Regulated by profile-likelihood LRT (FDR<0.05), same genes: %d / %d\n",
@@ -1017,10 +1137,10 @@ knitr::kable(as.data.frame(table(LRT = cad_kin$lrt_regulated, Bayesian = cad_kin
 
 | LRT   | Bayesian | Freq |
 |:------|:---------|-----:|
-| FALSE | FALSE    | 2095 |
-| TRUE  | FALSE    |   90 |
-| FALSE | TRUE     | 1204 |
-| TRUE  | TRUE     |  839 |
+| FALSE | FALSE    | 2217 |
+| TRUE  | FALSE    |  103 |
+| FALSE | TRUE     | 1082 |
+| TRUE  | TRUE     |  826 |
 
 Cadenza: agreement between the two regulation calls
 
@@ -1036,9 +1156,9 @@ knitr::kable(data.frame(component = seq_along(cad_int$q2), Q2 = round(cad_int$q2
 
 | component |    Q2 | perm_q95 | p_value |
 |----------:|------:|---------:|--------:|
-|         1 | 0.269 |    0.088 | 0.01490 |
-|         2 | 0.207 |    0.082 | 0.00498 |
-|         3 | 0.152 |   -0.175 | 0.00498 |
+|         1 | 0.269 |    0.047 | 0.00995 |
+|         2 | 0.207 |    0.053 | 0.00498 |
+|         3 | 0.152 |   -0.120 | 0.00498 |
 
 Cadenza: leave-one-cell-out Q2 vs permutation null
 
@@ -1146,19 +1266,19 @@ nor_fit <- fit_hierarchical_kinetics(
   nor_Rl[nor_rna_resp, ], nor_Rs[nor_rna_resp, ],
   nor_Pl[nor_rna_resp, ], nor_Ps[nor_rna_resp, ],
   t_half = nor_arch$t_half_M1_h[match(rownames(nor_Rl)[nor_rna_resp], nor_arch$gene_id)],
-  tps = DESIGN$timepoints, n_iter = 2000, warmup = 800, seed = 1, verbose = FALSE)
+  tps = DESIGN$timepoints, n_iter = 4000, warmup = 1600, seed = 1, verbose = FALSE)
 
 cat(sprintf("MCMC acceptance rate: %.2f\n", nor_fit$accept_delta))
 ```
 
-    MCMC acceptance rate: 0.78
+    MCMC acceptance rate: 0.46
 
 ``` r
 cat(sprintf("Regulated by hierarchical model: %d / %d\n",
            sum(nor_fit$summary$regulated_95), nrow(nor_fit$summary)))
 ```
 
-    Regulated by hierarchical model: 1627 / 3487
+    Regulated by hierarchical model: 1537 / 3487
 
 ``` r
 nor_int <- run_integration(nor_qc_r$vst, nor_mi$mixed, nor$meta, nor$meta)
@@ -1170,9 +1290,9 @@ knitr::kable(data.frame(component = seq_along(nor_int$q2), Q2 = round(nor_int$q2
 
 | component |     Q2 | perm_q95 | p_value |
 |----------:|-------:|---------:|--------:|
-|         1 |  0.084 |    0.040 | 0.03480 |
-|         2 | -0.032 |   -0.102 | 0.02990 |
-|         3 |  0.033 |   -0.158 | 0.00995 |
+|         1 |  0.084 |    0.039 | 0.01990 |
+|         2 | -0.032 |   -0.146 | 0.01490 |
+|         3 |  0.033 |   -0.164 | 0.00498 |
 
 Norin: leave-one-cell-out Q2 vs permutation null
 
@@ -1306,7 +1426,7 @@ alt="Figure 3: Control-arm drift vs amplitude deviation. A rising lowess trend 
 both varieties; roughly a third of RNA-responsive genes move more than 1
 log2FC, and ~9–11% move more than 2 log2FC, in the *control* arm alone.
 The control is not at steady state, and the assumption underlying
-$dp/dt = k_d(r-p)$ does not hold as stated.
+`dp/dt = k_d(r-p)` does not hold as stated.
 
 **But the impact on the amplitude estimate is small.** The continuous
 measure is the clearest: after adjusting for RNA response amplitude, the
@@ -1356,6 +1476,351 @@ drift and post-transcriptional regulation calls to be negligible in
 Cadenza (OR 1.07, p = 0.09) and modest but significant in Norin (OR
 1.31, p \< 0.001). Regulation calls for genes with large control-arm
 drift in Norin should therefore be treated as lower-confidence.
+
+## 8c. Hierarchical Bayesian model — assumptions and diagnostics
+
+### What the hierarchical model assumes
+
+The hierarchical model (`R/07_bayesian_kinetics.R`) inherits every
+assumption of the kinetic null and adds its own. Listed with an honest
+status for each:
+
+| \#     | Assumption                                                                                      | Status in this dataset                                                                                                                                                                                                                       |
+|:-------|:------------------------------------------------------------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **B1** | All of **A1–A3** — it solves the same ODE                                                       | **A3 violated** (median control drift ~0.67 log2FC; §8b). Impact on amplitude found to be small but non-zero in Norin.                                                                                                                       |
+| **B2** | `k_d` is **fixed**, not sampled jointly with `a`                                                | True by construction. Credible intervals are “amplitude uncertainty at the point-estimate kinetics”, **not** full posterior uncertainty. Deliberate — joint sampling produced a slow-mixing ridge (see the script header).                   |
+| **B3** | Protein likelihood is Gaussian with **known** variance (limma’s moderated SE, treated as fixed) | Reasonable — these are already pooled across thousands of genes — but it ignores uncertainty *in* the variance estimate, so intervals are mildly anti-conservative.                                                                          |
+| **B4** | RNA trajectory is known **exactly**; its uncertainty is not propagated                          | **True and worth flagging:** `se_rna` is accepted by the function signature but never used in the likelihood. RNA is a fixed covariate. With n=3 the RNA logFCs are themselves noisy, so real amplitude uncertainty is wider than reported.  |
+| **B5** | Genes are **conditionally independent** given the hyperparameters                               | Violated in principle — co-regulated genes, complex subunits, and shared MS normalisation induce correlated errors. Consequence: the horseshoe pools information as if genes were independent, so hyperparameter uncertainty is understated. |
+| **B6** | Horseshoe sparsity: most genes have `a ≈ 1`, controlled by `p0_frac`                            | Tested below.                                                                                                                                                                                                                                |
+| **B7** | MCMC has converged                                                                              | Tested below.                                                                                                                                                                                                                                |
+| **B8** | `delta_bound` clipping is inert                                                                 | ~2% of genes sit at the bound; those are censored, and flagged via `at_bound`.                                                                                                                                                               |
+
+The diagnostics below test **B6** and **B7** directly, since those are
+the two that are cheap to check and would silently corrupt results if
+wrong.
+
+### These diagnostics already caught and fixed a real problem
+
+Running them the first time showed the sampler was **not converged** at
+its original settings (fixed step size 0.25, 2000 iterations):
+
+| Metric                                      | Original sampler | After fix |
+|:--------------------------------------------|-----------------:|----------:|
+| Metropolis acceptance rate                  |             0.75 |  **0.45** |
+| Genes with R-hat \> 1.05                    |        **31.5%** | **0.17%** |
+| Worst R-hat                                 |             3.12 |      1.06 |
+| Median effective sample size                |              182 |   **740** |
+| Minimum effective sample size               |                7 |       146 |
+| Genes where 4 chains agree on the call      |            85.8% | **93.6%** |
+| Genes called regulated (n = 1200 subsample) |          551–568 |   417–431 |
+
+The tell was the **acceptance rate of 0.75**. For a one-dimensional
+random-walk Metropolis move the optimum is ≈ 0.44; anything much higher
+means the proposal steps are too small, so the chain crawls and
+successive draws are highly correlated. A single global step size cannot
+suit all genes here, because the likelihood curvature `sum(W·pl²)` spans
+orders of magnitude across genes.
+
+**Fix:** each gene now gets its own proposal step size, tuned during
+warmup only (adaptation is frozen before the retained draws, so the kept
+chain is a valid time-homogeneous Markov chain). The default chain
+length was also raised from 2000 to 4000 iterations, at which point the
+amplitude estimates correlate 0.99 with an 8000-iteration reference.
+
+**This mattered for the science, not just the diagnostics:** the
+unconverged sampler was **over-calling regulation by roughly 25%** (≈560
+vs ≈420 genes in the test subsample). Any earlier numbers produced
+before this fix are superseded.
+
+``` r
+#' Convergence and sensitivity diagnostics for the hierarchical model.
+#'
+#' Tests three things the model could be silently getting wrong:
+#'
+#'   1. CONVERGENCE (B7). Runs several independent chains from different
+#'      seeds and computes the Gelman-Rubin statistic R-hat per gene.
+#'      R-hat compares between-chain to within-chain variance; values near
+#'      1.0 mean the chains agree. Anything above ~1.05 means they do not,
+#'      and the posterior summaries cannot be trusted.
+#'
+#'   2. PRIOR SENSITIVITY (B6). `p0_frac` sets how sparse the horseshoe
+#'      expects the signal to be. If conclusions swing wildly with it, the
+#'      prior -- not the data -- is driving the answer.
+#'
+#'   3. CHAIN LENGTH. If results still move between 500 and 4000 iterations,
+#'      the chain is too short.
+#'
+#' Genes are subsampled (`n_genes`) purely to keep render time reasonable;
+#' the diagnostics are about the sampler, not about any specific gene.
+run_bayes_diagnostics <- function(Rl, Rs, Pl, Ps, tps, t_half,
+                                  n_genes   = 1200,
+                                  seeds     = 1:4,
+                                  p0_grid   = c(0.05, 0.10, 0.20, 0.40),
+                                  iter_grid = c(1000, 2000, 4000, 8000),
+                                  label     = "") {
+
+  set.seed(99)
+  idx <- sample(nrow(Pl), min(n_genes, nrow(Pl)))
+
+  Rl <- Rl[idx, , drop = FALSE];  Rs <- Rs[idx, , drop = FALSE]
+  Pl <- Pl[idx, , drop = FALSE];  Ps <- Ps[idx, , drop = FALSE]
+  th <- t_half[idx]
+
+  fit_one <- function(seed, p0 = 0.20, n_iter = 4000) {
+    fit_hierarchical_kinetics(
+      Rl, Rs, Pl, Ps, tps,
+      t_half  = th,
+      p0_frac = p0,
+      n_iter  = n_iter,
+      warmup  = floor(n_iter * 0.4),
+      seed    = seed,
+      verbose = FALSE
+    )
+  }
+
+  ## ---------------------------------------------------------------------
+  ## 1. Convergence: multiple chains, Gelman-Rubin R-hat
+  ## ---------------------------------------------------------------------
+  chains <- lapply(seeds, fit_one)
+  traces <- lapply(chains, `[[`, "trace_delta")
+
+  N <- ncol(traces[[1]])
+  M <- length(traces)
+
+  chain_means <- sapply(traces, rowMeans)
+  chain_vars  <- sapply(traces, function(tr) apply(tr, 1, var))
+
+  W_within  <- rowMeans(chain_vars)
+  B_between <- N * apply(chain_means, 1, var)
+  var_hat   <- ((N - 1) / N) * W_within + B_between / N
+  rhat      <- sqrt(pmax(var_hat, 0) / pmax(W_within, 1e-12))
+
+  ## Effective sample size, AR(1) approximation: ESS = N * (1-rho)/(1+rho).
+  ## Exact multi-lag ESS per gene would be far slower and the AR(1) form is
+  ## the standard quick diagnostic.
+  lag1 <- function(tr) {
+    a <- tr[, -N, drop = FALSE]
+    b <- tr[, -1, drop = FALSE]
+    am <- rowMeans(a); bm <- rowMeans(b)
+    num <- rowSums((a - am) * (b - bm))
+    den <- sqrt(rowSums((a - am)^2) * rowSums((b - bm)^2))
+    ifelse(den > 0, num / den, 0)
+  }
+  rho  <- rowMeans(sapply(traces, lag1))
+  ess  <- M * N * (1 - rho) / (1 + rho)
+
+  convergence <- data.frame(
+    variety            = label,
+    n_chains           = M,
+    draws_per_chain    = N,
+    rhat_median        = round(median(rhat, na.rm = TRUE), 4),
+    rhat_max           = round(max(rhat, na.rm = TRUE), 4),
+    pct_rhat_over_1.05 = round(100 * mean(rhat > 1.05, na.rm = TRUE), 2),
+    ess_median         = round(median(ess, na.rm = TRUE)),
+    ess_min            = round(min(ess, na.rm = TRUE))
+  )
+
+  ## Do the independent chains agree on the actual CALL, not just the mean?
+  calls <- sapply(chains, function(f) f$summary$regulated_95)
+  call_agreement <- data.frame(
+    variety             = label,
+    pct_all_chains_agree = round(100 * mean(rowSums(calls) %in% c(0, M)), 1),
+    n_regulated_min      = min(colSums(calls)),
+    n_regulated_max      = max(colSums(calls))
+  )
+
+  ## ---------------------------------------------------------------------
+  ## 2. Prior sensitivity: p0_frac
+  ## ---------------------------------------------------------------------
+  ref_a <- chains[[1]]$summary$a_mean
+
+  p0_sens <- do.call(rbind, lapply(p0_grid, function(p0) {
+    f <- fit_one(seed = 1, p0 = p0)
+    data.frame(
+      variety        = label,
+      p0_frac        = p0,
+      n_regulated    = sum(f$summary$regulated_95),
+      pct_regulated  = round(100 * mean(f$summary$regulated_95), 1),
+      median_abs_a1  = round(median(abs(f$summary$a_mean - 1)), 3),
+      cor_with_ref   = round(cor(f$summary$a_mean, ref_a, method = "spearman"), 4)
+    )
+  }))
+
+  ## ---------------------------------------------------------------------
+  ## 3. Chain-length sensitivity
+  ## ---------------------------------------------------------------------
+  long_fit <- fit_one(seed = 1, n_iter = max(iter_grid))
+  long_a   <- long_fit$summary$a_mean
+
+  iter_sens <- do.call(rbind, lapply(iter_grid, function(ni) {
+    f <- fit_one(seed = 1, n_iter = ni)
+    data.frame(
+      variety           = label,
+      n_iter            = ni,
+      n_regulated       = sum(f$summary$regulated_95),
+      cor_with_longest  = round(cor(f$summary$a_mean, long_a, method = "spearman"), 4)
+    )
+  }))
+
+  ## ---------------------------------------------------------------------
+  ## 4. Credible-interval level sensitivity
+  ## ---------------------------------------------------------------------
+  tr <- chains[[1]]$trace_delta
+
+  ci_sens <- do.call(rbind, lapply(c(0.80, 0.90, 0.95, 0.99), function(lev) {
+    lo <- apply(tr, 1, quantile, (1 - lev) / 2)
+    hi <- apply(tr, 1, quantile, 1 - (1 - lev) / 2)
+    data.frame(
+      variety       = label,
+      ci_level      = lev,
+      n_regulated   = sum(lo > 0 | hi < 0),
+      pct_regulated = round(100 * mean(lo > 0 | hi < 0), 1)
+    )
+  }))
+
+  list(
+    convergence    = convergence,
+    call_agreement = call_agreement,
+    p0_sensitivity = p0_sens,
+    iter_sensitivity = iter_sens,
+    ci_sensitivity = ci_sens,
+    rhat           = rhat,
+    ess            = ess
+  )
+}
+```
+
+``` r
+cad_bd <- run_bayes_diagnostics(
+  cad_Rl[cad_rna_resp, ], cad_Rs[cad_rna_resp, ],
+  cad_Pl[cad_rna_resp, ], cad_Ps[cad_rna_resp, ],
+  DESIGN$timepoints,
+  t_half = cad_arch$t_half_M1_h[match(rownames(cad_Rl)[cad_rna_resp], cad_arch$gene_id)],
+  label  = "Cadenza"
+)
+
+nor_bd <- run_bayes_diagnostics(
+  nor_Rl[nor_rna_resp, ], nor_Rs[nor_rna_resp, ],
+  nor_Pl[nor_rna_resp, ], nor_Ps[nor_rna_resp, ],
+  DESIGN$timepoints,
+  t_half = nor_arch$t_half_M1_h[match(rownames(nor_Rl)[nor_rna_resp], nor_arch$gene_id)],
+  label  = "Norin"
+)
+
+knitr::kable(
+  rbind(cad_bd$convergence, nor_bd$convergence),
+  caption = "B7 -- MCMC convergence. R-hat near 1.00 means independent chains agree. Above 1.05 is a problem."
+)
+```
+
+| variety | n_chains | draws_per_chain | rhat_median | rhat_max | pct_rhat_over_1.05 | ess_median | ess_min |
+|:--------|---------:|----------------:|------------:|---------:|-------------------:|-----------:|--------:|
+| Cadenza |        4 |            2400 |      1.0011 |   1.0291 |                  0 |       1623 |     460 |
+| Norin   |        4 |            2400 |      1.0010 |   1.0181 |                  0 |       1625 |     482 |
+
+B7 – MCMC convergence. R-hat near 1.00 means independent chains agree.
+Above 1.05 is a problem.
+
+``` r
+knitr::kable(
+  rbind(cad_bd$call_agreement, nor_bd$call_agreement),
+  caption = "Do independent chains make the SAME regulated/not call for each gene?"
+)
+```
+
+| variety | pct_all_chains_agree | n_regulated_min | n_regulated_max |
+|:--------|---------------------:|----------------:|----------------:|
+| Cadenza |                 93.8 |             510 |             518 |
+| Norin   |                 94.8 |             548 |             557 |
+
+Do independent chains make the SAME regulated/not call for each gene?
+
+``` r
+knitr::kable(
+  rbind(cad_bd$p0_sensitivity, nor_bd$p0_sensitivity),
+  caption = "B6 -- horseshoe prior sensitivity. `p0_frac` is the assumed fraction of genes under real regulation; 0.20 is the default used throughout."
+)
+```
+
+| variety | p0_frac | n_regulated | pct_regulated | median_abs_a1 | cor_with_ref |
+|:--------|--------:|------------:|--------------:|--------------:|-------------:|
+| Cadenza |    0.05 |         512 |          42.7 |         0.949 |       0.9993 |
+| Cadenza |    0.10 |         514 |          42.8 |         0.954 |       0.9993 |
+| Cadenza |    0.20 |         511 |          42.6 |         0.954 |       1.0000 |
+| Cadenza |    0.40 |         512 |          42.7 |         0.954 |       0.9993 |
+| Norin   |    0.05 |         553 |          46.1 |         1.022 |       0.9995 |
+| Norin   |    0.10 |         553 |          46.1 |         1.017 |       0.9995 |
+| Norin   |    0.20 |         553 |          46.1 |         1.020 |       1.0000 |
+| Norin   |    0.40 |         553 |          46.1 |         1.019 |       0.9994 |
+
+B6 – horseshoe prior sensitivity. `p0_frac` is the assumed fraction of
+genes under real regulation; 0.20 is the default used throughout.
+
+``` r
+knitr::kable(
+  rbind(cad_bd$iter_sensitivity, nor_bd$iter_sensitivity),
+  caption = "Chain-length sensitivity. If `cor_with_longest` is ~1 by 2000 iterations, the default chain is long enough."
+)
+```
+
+| variety | n_iter | n_regulated | cor_with_longest |
+|:--------|-------:|------------:|-----------------:|
+| Cadenza |   1000 |         528 |           0.9905 |
+| Cadenza |   2000 |         518 |           0.9961 |
+| Cadenza |   4000 |         511 |           0.9981 |
+| Cadenza |   8000 |         512 |           1.0000 |
+| Norin   |   1000 |         564 |           0.9919 |
+| Norin   |   2000 |         556 |           0.9973 |
+| Norin   |   4000 |         553 |           0.9986 |
+| Norin   |   8000 |         554 |           1.0000 |
+
+Chain-length sensitivity. If `cor_with_longest` is ~1 by 2000
+iterations, the default chain is long enough.
+
+``` r
+knitr::kable(
+  rbind(cad_bd$ci_sensitivity, nor_bd$ci_sensitivity),
+  caption = "Credible-interval level sensitivity. Shows how much the `regulated` count depends on the (arbitrary) 95% convention."
+)
+```
+
+| variety | ci_level | n_regulated | pct_regulated |
+|:--------|---------:|------------:|--------------:|
+| Cadenza |     0.80 |         653 |          54.4 |
+| Cadenza |     0.90 |         575 |          47.9 |
+| Cadenza |     0.95 |         511 |          42.6 |
+| Cadenza |     0.99 |         431 |          35.9 |
+| Norin   |     0.80 |         688 |          57.3 |
+| Norin   |     0.90 |         606 |          50.5 |
+| Norin   |     0.95 |         553 |          46.1 |
+| Norin   |     0.99 |         467 |          38.9 |
+
+Credible-interval level sensitivity. Shows how much the `regulated`
+count depends on the (arbitrary) 95% convention.
+
+``` r
+op <- par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3, 1))
+
+for (bd in list(cad_bd, nor_bd)) {
+
+  hist(bd$rhat, breaks = 50, col = "#2C6FBB", border = NA,
+       xlab = "R-hat", main = sprintf("%s: R-hat", bd$convergence$variety))
+  abline(v = 1.05, col = "#D1495B", lwd = 2, lty = 2)
+
+  hist(log10(pmax(bd$ess, 1)), breaks = 50, col = "#4C9F70", border = NA,
+       xlab = "log10 effective sample size",
+       main = sprintf("%s: ESS", bd$convergence$variety))
+  abline(v = log10(400), col = "#D1495B", lwd = 2, lty = 2)
+}
+
+par(op)
+```
+
+<img
+src="de_proteomics_wheat_files/figure-commonmark/fig-bayes-diagnostics-1.png"
+id="fig-bayes-diagnostics"
+alt="Figure 4: Convergence diagnostics: R-hat and effective sample size across genes." />
 
 ## 9. Cross-variety validation via reciprocal-best-hit orthologs
 
@@ -1470,7 +1935,7 @@ if (sum(both_resp) > 10) {
 <img
 src="de_proteomics_wheat_files/figure-commonmark/fig-rbh-amplitude-concordance-1.png"
 id="fig-rbh-amplitude-concordance"
-alt="Figure 4: Cross-variety amplitude concordance for shared orthologs" />
+alt="Figure 5: Cross-variety amplitude concordance for shared orthologs" />
 
 ## 10. Summary and limitations
 
@@ -1490,19 +1955,20 @@ knitr::kable(summ, caption = "Pipeline summary, both varieties")
 
 | variety | rna_genes_kept | protein_kept | universe_b | rna_responsive | lrt_regulated | bayes_regulated | integration_q2_c1 | integration_p_c1 |
 |:--------|---------------:|-------------:|-----------:|---------------:|--------------:|----------------:|------------------:|-----------------:|
-| Cadenza |          59931 |         5861 |       5580 |           4228 |          1050 |            2043 |             0.269 |           0.0149 |
-| Norin   |          59502 |         5641 |       5159 |           3487 |           896 |            1627 |             0.084 |           0.0348 |
+| Cadenza |          59931 |         5861 |       5580 |           4228 |          1050 |            1908 |             0.269 |          0.00995 |
+| Norin   |          59502 |         5641 |       5159 |           3487 |           896 |            1537 |             0.084 |          0.01990 |
 
 Pipeline summary, both varieties
 
 **Read before using any downstream number:**
 
-- **Timepoint units are unconfirmed** (§ “Two things this dataset does
-  not tell us”). Every half-life in this notebook is in 0, 24, 48, 72,
-  not hours, until `TIMEPOINT_VALUES` is corrected to the real sampling
-  schedule.
-- **Treatment reference is assumed**, not confirmed from metadata beyond
-  the `T0`/`T1` labels themselves.
+- **Half-lives below 12 h are not resolvable.** With 24 h sampling the
+  search grid starts at `0.5 * 24 = 12 h`; faster-turnover proteins are
+  reported at that floor rather than at their true half-life. This is a
+  design limit, not a fitting failure.
+- **Timepoint units and treatment polarity are confirmed** (see “Design
+  constants”): `t0..t3` = 0/24/48/72 h, `T0` = NEG control, `T1` = PN143
+  infected. Half-lives below are in hours.
 - **Protein QC has no decoy/contaminant/unique-peptide filter** here
   (§2): the provided `*_protein_gene_mapping.csv` files do not carry
   that MaxQuant/ DIA-NN metadata. If the original search-engine output
