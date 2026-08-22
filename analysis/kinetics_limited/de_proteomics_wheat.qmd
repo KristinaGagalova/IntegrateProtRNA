@@ -351,13 +351,15 @@ Both produce the identical snapshot pattern. This step exists to separate them, 
 
 ### The Two Nested Models
 
-Everything is expressed as fold-change relative to the time-matched control, so $r(t) = 2^{\text{logFC\_RNA}(t)}$ and $p(t) = 2^{\text{logFC\_protein}(t)}$, both starting at 1.
+Everything is expressed as fold-change relative to the time-matched control, so $r(t) = 2^{\text{logFC}_{\text{RNA}}(t)}$ and $p(t) = 2^{\text{logFC}_{\text{protein}}(t)}$, both starting at 1.
 
 ### M0 - The Kinetic Null
 
 If the treatment changed only transcript abundance, the protein is forced to follow first-order kinetics:
 
-$$ \frac{dp}{dt} = k_d \cdot (r(t) - p(t)), \quad p(0) = 1 $$
+$$
+\frac{dp}{dt} = k_d \cdot (r(t) - p(t)), \quad p(0) = 1
+$$
 
 One free parameter: $k_d$, the degradation rate (reported as half-life $\log(2)/k_d$). This is the trajectory the protein must take if nothing post-transcriptional is happening. Implemented via `integrate_protein_mat(..., ks = kd, kd = kd, P0 = 1)` - setting `ks = kd` makes the steady state equal $r$, which is what encodes "protein eventually catches up to its mRNA."
 
@@ -365,7 +367,9 @@ One free parameter: $k_d$, the degradation rate (reported as half-life $\log(2)/
 
 Adds a single scaling factor:
 
-$$ \text{logFC\_protein}(t) = a \cdot \log_2 p(t; k_d) $$
+$$
+\text{logFC}_{\text{protein}}(t) = a \cdot \log_2 p(t; k_d)
+$$
 
 $a = 1$ is exactly M0. The interpretation of $a$ is the whole point:
 
@@ -415,7 +419,10 @@ unchanged                                    (default)
         └── a ≤ 0                            → anticorrelated
 ```
 
-**Two structural properties worth documenting:** \* `regulated` requires `rna_resp`. Amplitude is meaningless without an RNA signal to scale --- for a flat transcript, $a \cdot 0 = 0$ for any $a$. This gate is what makes `protein_only` a separate category rather than a spuriously extreme amplitude. \* `concordant` vs `kinetic_lag` is a labelling split, not a test. Both mean "the kinetic null was sufficient." The slow cutoff just separates fast-turnover proteins from slow ones for readability; genes near the line are on a continuum.
+**Two structural properties worth documenting:**
+
+-   `regulated` requires `rna_resp`. Amplitude is meaningless without an RNA signal to scale --- for a flat transcript, $a \cdot 0 = 0$ for any $a$. This gate is what makes `protein_only` a separate category rather than a spuriously extreme amplitude.
+-   `concordant` vs `kinetic_lag` is a labelling split, not a test. Both mean "the kinetic null was sufficient." The slow cutoff just separates fast-turnover proteins from slow ones for readability; genes near the line are on a continuum.
 
 ## Identifiability --- The `kinetics_limited` Class
 
@@ -459,11 +466,17 @@ The model is **not** a necessary consequence of "the treatment only changed tran
 
 Start from absolute abundance in each arm, assuming first-order kinetics with the *same* rate constants in both:
 
-$$\frac{dP_c}{dt} = k_s R_c(t) - k_d P_c(t), \qquad \frac{dP_t}{dt} = k_s R_t(t) - k_d P_t(t)$$
+$$
+\frac{dP_c}{dt} = k_s R_c(t) - k_d P_c(t), \qquad \frac{dP_t}{dt} = k_s R_t(t) - k_d P_t(t)
+$$
 
 Define the fold-changes $r = R_t/R_c$ and $p = P_t/P_c$. Differentiating the quotient:
 
-$$\frac{dp}{dt} = \frac{P_t' P_c - P_t P_c'}{P_c^2} = \frac{k_s (R_t P_c - R_c P_t)}{P_c^2} = \underbrace{\frac{k_s R_c}{P_c}}_{\text{coefficient}} (r - p)$$
+$$
+\frac{dp}{dt} = \frac{P_t' P_c - P_t P_c'}{P_c^2}
+              = \frac{k_s (R_t P_c - R_c P_t)}{P_c^2}
+              = \underbrace{\frac{k_s R_c}{P_c}}_{\text{coefficient}} (r - p)
+$$
 
 The $k_d$ terms **cancel exactly**. The coefficient is $k_s R_c / P_c$, *not* $k_d$. It equals $k_d$ only when $k_s R_c = k_d P_c$ --- that is, only when the control arm is at steady state.
 
