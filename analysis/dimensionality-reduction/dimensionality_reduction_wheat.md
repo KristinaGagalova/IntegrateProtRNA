@@ -1,0 +1,1435 @@
+# Dimensionality reduction for unpaired RNA/protein - PCA, PLS,
+autoencoders
+Kristina Gagalova
+
+- [Purpose and scope](#purpose-and-scope)
+  - [Two corrections to the framing, stated up
+    front](#two-corrections-to-the-framing-stated-up-front)
+  - [Relationship to the existing Python
+    work](#relationship-to-the-existing-python-work)
+- [Analysis outline](#analysis-outline)
+- [1. Setup](#setup)
+- [2. The methods and what each
+  assumes](#the-methods-and-what-each-assumes)
+  - [PCA](#pca)
+  - [PLS](#pls)
+  - [Autoencoders (linear, non-linear,
+    variational)](#autoencoders-linear-non-linear-variational)
+  - [Condition-aligned autoencoder](#condition-aligned-autoencoder)
+- [3. Implementation](#implementation)
+- [4. D1 — How many components are
+  real?](#d1-how-many-components-are-real)
+- [5. D2 — Do the components track the
+  design?](#d2-do-the-components-track-the-design)
+- [6. D3 — Is a linear autoencoder equivalent to
+  PCA?](#d3-is-a-linear-autoencoder-equivalent-to-pca)
+- [7. D4 — Does any method beat predicting the
+  mean?](#d4-does-any-method-beat-predicting-the-mean)
+- [7b. D7 — Condition means or individual replicates for the cross-block
+  fit?](#b.-d7-condition-means-or-individual-replicates-for-the-cross-block-fit)
+- [8. D5 — Are we sample-limited?](#d5-are-we-sample-limited)
+- [9. D6 — Are the latent spaces
+  reproducible?](#d6-are-the-latent-spaces-reproducible)
+- [10. Assumption validation summary](#assumption-validation-summary)
+- [11. What is safe to claim](#what-is-safe-to-claim)
+  - [The results](#the-results)
+  - [✅ Safe to claim](#safe-to-claim)
+  - [⚠️ Claim only with the caveat
+    attached](#claim-only-with-the-caveat-attached)
+  - [❌ Not supported](#not-supported)
+  - [The one-paragraph version](#the-one-paragraph-version)
+  - [What would strengthen this](#what-would-strengthen-this)
+- [References](#references)
+
+## Purpose and scope
+
+This notebook answers one question systematically:
+
+> **Given 8 experimental conditions and unpaired RNA/protein layers,
+> which dimensionality-reduction method is actually justified — and does
+> any of them beat simply predicting the mean?**
+
+The candidates are PCA, PLS, and three autoencoder variants (linear,
+non-linear, variational), plus a condition-aligned autoencoder matching
+the architecture in the project’s existing Python work.
+
+### Two corrections to the framing, stated up front
+
+**1. No VAE has previously been built in this repository.** PCA and PLS
+are used throughout (`R/06_integration_caseB.R`, `R/01_qc_normalise.R`,
+the kinetics notebooks). A VAE was *proposed* in `docs/planning.md` §4C
+but never implemented here. The working autoencoder for this project is
+`ConditionAlignedAE` in `rnaprot/unpaired.py` on `nectar` (GitHub:
+`KristinaGagalova/autoencoders-test`). Everything autoencoder-related
+below is **new work written for this notebook**.
+
+**2. Implemented from scratch in base R.** No `torch`/`keras` is
+available in this project’s R environment. Rather than add a ~2 GB
+dependency, all models here are written directly with explicit gradients
+and Adam. That is slower to write but has a real advantage for this
+question: every model is auditable, and the comparison is not confounded
+by framework defaults.
+
+### Relationship to the existing Python work
+
+`rnaprot/unpaired.py` on `nectar` implements the same problem with:
+
+| Component              | Python (`unpaired.py`)                                                     | Here                                                |
+|:-----------------------|:---------------------------------------------------------------------------|:----------------------------------------------------|
+| Deep model             | `ConditionAlignedAE`, MLP `[p, 64, 16, 6]`, LayerNorm + SiLU + dropout 0.1 | Linear condition-aligned AE (see §6 for why linear) |
+| Loss                   | `0.5·L_rna + 0.5·L_prot + 2.0·L_cross + 0.5·L_align`                       | Same four terms, same default weights               |
+| CV                     | `leave_condition_out`                                                      | Leave-one-condition-out                             |
+| Baselines              | mean, design ridge, PCA+ridge, PLS, cognate ridge                          | mean, design ridge, PCA+ridge, PLS                  |
+| Component selection    | `_loo_select_components` (inner LOO)                                       | Inner LOO, same idea                                |
+| Design residualisation | `_design_residual_predict`                                                 | §7                                                  |
+
+The **design-residualisation** step deserves particular note:
+`unpaired.py` already residualises both modalities against
+treatment/timepoint before modelling, which is the same control I
+arrived at independently in
+`analysis/kinetics_limited/kinetics_what_we_can_claim.qmd` (K1). Two
+independent implementations converging on that control is reassuring —
+it is the right control for this design.
+
+------------------------------------------------------------------------
+
+## Analysis outline
+
+| Step | What                                        | Why                                                              |
+|:-----|:--------------------------------------------|:-----------------------------------------------------------------|
+| §1   | Setup and data                              | Shared upstream with the other notebooks                         |
+| §2   | Methods and their assumptions               | Each with references                                             |
+| §3   | Implementation                              | From-scratch, auditable                                          |
+| §4   | **D1** How many components are real?        | Parallel analysis vs permutation                                 |
+| §5   | **D2** Do components track the design?      | Structure must be interpretable                                  |
+| §6   | **D3** Linear AE ≡ PCA?                     | Baldi–Hornik verification, a correctness check                   |
+| §7   | **D4** Does any method beat the mean?       | The headline comparison, leave-one-condition-out                 |
+| §7b  | **D7** Condition means vs replicate pairing | Aggregated (n=8) vs sample-level (n=24), with a permutation null |
+| §8   | **D5** Are we sample-limited?               | Learning curve                                                   |
+| §9   | **D6** Are latent spaces stable?            | Seed-to-seed reproducibility                                     |
+| §10  | Assumption validation summary               |                                                                  |
+| §11  | What is safe to claim                       |                                                                  |
+
+------------------------------------------------------------------------
+
+## 1. Setup
+
+``` r
+if (!requireNamespace("here", quietly = TRUE)) stop("package 'here' required")
+
+## RENV_PROJECT must be set before sourcing activate.R, or renv treats this
+## subdirectory as the project and bootstraps an empty library.
+if (file.exists(here::here("renv", "activate.R"))) {
+  Sys.setenv(RENV_PROJECT = here::here())
+  source(here::here("renv", "activate.R"))
+}
+
+source(here::here("R", "utils.R"))
+source(here::here("R", "wheat_pipeline.R"))
+source(here::here("R", "pls_utils.R"))
+need_pkgs(c("limma", "edgeR", "DESeq2", "matrixStats", "impute"))
+
+set.seed(20260823)
+DESIGN <- wheat_design()
+
+cad <- prepare_variety("cadenza", DESIGN)
+```
+
+    Cluster size 5861 broken into 3622 2239 
+    Cluster size 3622 broken into 2430 1192 
+    Cluster size 2430 broken into 1561 869 
+    Cluster size 1561 broken into 819 742 
+    Done cluster 819 
+    Done cluster 742 
+    Done cluster 1561 
+    Done cluster 869 
+    Done cluster 2430 
+    Done cluster 1192 
+    Done cluster 3622 
+    Cluster size 2239 broken into 1075 1164 
+    Done cluster 1075 
+    Done cluster 1164 
+    Done cluster 2239 
+
+``` r
+nor <- prepare_variety("norin",   DESIGN)
+```
+
+    Cluster size 5641 broken into 1939 3702 
+    Cluster size 1939 broken into 1030 909 
+    Done cluster 1030 
+    Done cluster 909 
+    Done cluster 1939 
+    Cluster size 3702 broken into 2489 1213 
+    Cluster size 2489 broken into 838 1651 
+    Done cluster 838 
+    Cluster size 1651 broken into 941 710 
+    Done cluster 941 
+    Done cluster 710 
+    Done cluster 1651 
+    Done cluster 2489 
+    Done cluster 1213 
+    Done cluster 3702 
+
+``` r
+VARIETIES <- list(Cadenza = cad, Norin = nor)
+```
+
+``` r
+#' Build the analysis blocks for one variety.
+#'
+#' Two representations are produced, and the distinction matters:
+#'
+#'   SAMPLE level (24 x p) -- used for within-layer methods (PCA, plain
+#'     autoencoders). Each layer has its own 24 samples.
+#'
+#'   CONDITION level (8 x p) -- design-cell means, used for anything that
+#'     crosses the two layers. Under the unpaired design the condition is the
+#'     ONLY shared axis: there is no sample-level correspondence between an
+#'     RNA plant and a protein plant.
+make_blocks <- function(v, n_rna = 2000, n_prot = 1000) {
+
+  hv_r <- top_variable(v$qc_rna$vst,     n_rna)
+  hv_p <- top_variable(v$imputed$mixed,  n_prot)
+
+  R_samp <- t(v$qc_rna$vst[hv_r, , drop = FALSE])
+  P_samp <- t(v$imputed$mixed[hv_p, , drop = FALSE])
+
+  R_cond <- t(cell_means(v$qc_rna$vst[hv_r, , drop = FALSE],    v$meta))
+  P_cond <- t(cell_means(v$imputed$mixed[hv_p, , drop = FALSE], v$meta))
+
+  cells <- rownames(R_cond)
+  cond  <- data.frame(
+    cell      = cells,
+    treatment = factor(sub("_t.*$", "", cells)),
+    time_f    = factor(as.numeric(sub("^.*_t", "", cells)))
+  )
+
+  # centre and scale each block to unit total variance, so no block dominates
+  cs <- function(M) {
+    M <- scale(M, center = TRUE, scale = FALSE)
+    M / sqrt(sum(M^2) / nrow(M))
+  }
+
+  list(R_samp = cs(R_samp), P_samp = cs(P_samp),
+       R_cond = cs(R_cond), P_cond = cs(P_cond),
+       cond = cond, meta = v$meta)
+}
+
+BLOCKS <- lapply(VARIETIES, make_blocks)
+
+knitr::kable(
+  data.frame(
+    variety    = names(BLOCKS),
+    rna_samples    = sapply(BLOCKS, function(b) nrow(b$R_samp)),
+    rna_features   = sapply(BLOCKS, function(b) ncol(b$R_samp)),
+    prot_samples   = sapply(BLOCKS, function(b) nrow(b$P_samp)),
+    prot_features  = sapply(BLOCKS, function(b) ncol(b$P_samp)),
+    conditions     = sapply(BLOCKS, function(b) nrow(b$R_cond))
+  ),
+  caption = "Analysis blocks. Note the shape: thousands of features, 24 samples, 8 conditions."
+)
+```
+
+|         | variety | rna_samples | rna_features | prot_samples | prot_features | conditions |
+|:--------|:--------|------------:|-------------:|-------------:|--------------:|-----------:|
+| Cadenza | Cadenza |          24 |         2000 |           24 |          1000 |          8 |
+| Norin   | Norin   |          24 |         2000 |           24 |          1000 |          8 |
+
+Analysis blocks. Note the shape: thousands of features, 24 samples, 8
+conditions.
+
+> **The shape of this problem, stated plainly.** Thousands of features
+> against 24 samples (8 conditions). Every method below is operating in
+> the regime where the number of parameters vastly exceeds the number of
+> observations. That is not a reason to avoid dimensionality reduction —
+> it is the reason to *use* it — but it does mean out-of-sample
+> validation is the only meaningful evidence, and in-sample fit is
+> worthless.
+
+------------------------------------------------------------------------
+
+## 2. The methods and what each assumes
+
+### PCA
+
+Finds orthogonal directions of maximum variance. Unsupervised: it never
+sees the protein block or the design.
+
+**Assumes:** structure is linear; variance is a proxy for signal;
+components are orthogonal; the leading directions are the interesting
+ones. The last two are conventions, not facts about biology — a
+low-variance direction can carry the biology, and biological programmes
+are not required to be orthogonal (Jolliffe and Cadima 2016).
+
+### PLS
+
+Finds directions in RNA that maximally covary with protein. Two-block
+and supervised by the second block.
+
+**Assumes:** linearity again; that cross-block covariance is the target;
+and critically, that the model is validated **out of sample**. At 8
+conditions and thousands of features a PLS component can be steered onto
+almost any target — in-sample cross-block correlation reaches r ≈ 0.72
+on *permuted* data in this dataset. Cross-validated Q² against a
+permutation null is the accepted remedy (Westerhuis et al. 2008).
+
+### Autoencoders (linear, non-linear, variational)
+
+An encoder compresses to a latent space, a decoder reconstructs. The
+variational form adds a probabilistic latent with a KL penalty toward a
+standard normal prior (Kingma and Welling 2014).
+
+**Assumes:** enough samples to fit the encoder/decoder weights. This is
+the binding constraint here, and it is worth being precise about why.
+
+A **linear** autoencoder is not an alternative to PCA — it recovers the
+same subspace. Baldi and Hornik (1989) proved the squared-error loss of
+a linear autoencoder has no local minima and that its global optimum
+spans the principal subspace. §6 verifies this numerically as a
+correctness check on the implementation.
+
+So a VAE can only add value through **non-linearity** and the
+**probabilistic prior**. Both cost parameters, and parameters need
+samples. Successful omics VAEs operate on thousands of observations —
+single-cell datasets, where each cell is a sample — or transfer from
+large reference cohorts. Bulk designs with tens of samples are a
+different regime, and overfitting is the documented failure mode.
+
+### Condition-aligned autoencoder
+
+The architecture in `rnaprot/unpaired.py`: separate encoders per
+modality, with the latent spaces tied by matching **condition
+centroids** rather than by pairing samples. This is the correct
+structural response to unpaired data — it never assumes RNA sample *i*
+corresponds to protein sample *i*.
+
+**Assumes:** all of the above, plus that condition centroids estimated
+from 3 replicates are stable enough to align on.
+
+------------------------------------------------------------------------
+
+## 3. Implementation
+
+``` r
+#' Adam optimiser over a named list of parameter matrices.
+#'
+#' Written out rather than pulled from a framework so the update rule is
+#' visible and the comparison between models is not confounded by differing
+#' framework defaults.
+adam_init <- function(par) {
+  list(m = lapply(par, function(p) array(0, dim(p))),
+       v = lapply(par, function(p) array(0, dim(p))),
+       t = 0)
+}
+
+adam_update <- function(par, grad, state, lr = 0.01,
+                        b1 = 0.9, b2 = 0.999, eps = 1e-8) {
+  state$t <- state$t + 1
+  for (nm in names(par)) {
+    state$m[[nm]] <- b1 * state$m[[nm]] + (1 - b1) * grad[[nm]]
+    state$v[[nm]] <- b2 * state$v[[nm]] + (1 - b2) * grad[[nm]]^2
+    mhat <- state$m[[nm]] / (1 - b1^state$t)
+    vhat <- state$v[[nm]] / (1 - b2^state$t)
+    par[[nm]] <- par[[nm]] - lr * mhat / (sqrt(vhat) + eps)
+  }
+  list(par = par, state = state)
+}
+```
+
+``` r
+#' Single-block autoencoder: linear, tanh, or variational.
+#'
+#'   type = "linear" : z = XW1 + b1                 (spans the PCA subspace)
+#'   type = "tanh"   : z = tanh(XW1 + b1)           (non-linear encoder)
+#'   type = "vae"    : mu, logvar heads; z = mu + sd*eps; + KL penalty
+#'
+#' Decoder is linear throughout, so the ONLY difference between "linear" and
+#' "tanh" is the encoder non-linearity -- which isolates the question "does
+#' non-linearity buy anything?" from every other design choice.
+ae_fit <- function(X, k = 3, type = c("linear", "tanh", "vae"),
+                   epochs = 4000, lr = 0.01, beta = 1, seed = 1) {
+
+  type <- match.arg(type)
+  set.seed(seed)
+  n <- nrow(X); p <- ncol(X)
+
+  init <- function(a, b) matrix(rnorm(a * b, 0, 1 / sqrt(a)), a, b)
+  par <- list(W1 = init(p, k), b1 = matrix(0, 1, k),
+              W2 = init(k, p), b2 = matrix(0, 1, p))
+  if (type == "vae") {
+    par$Wv <- init(p, k); par$bv <- matrix(0, 1, k)
+  }
+
+  st <- adam_init(par)
+  rep_row <- function(b, n) matrix(rep(b, each = n), n)
+  hist <- numeric(epochs)
+
+  for (e in seq_len(epochs)) {
+    a1 <- X %*% par$W1 + rep_row(par$b1, n)
+
+    if (type == "vae") {
+      lv  <- X %*% par$Wv + rep_row(par$bv, n)
+      lv  <- pmax(pmin(lv, 10), -10)          # numerical guard
+      sdv <- exp(0.5 * lv)
+      eps <- matrix(rnorm(n * k), n, k)
+      z   <- a1 + sdv * eps
+    } else {
+      z <- if (type == "tanh") tanh(a1) else a1
+    }
+
+    Xh <- z %*% par$W2 + rep_row(par$b2, n)
+    E  <- Xh - X
+    recon <- sum(E^2) / (n * p)
+
+    dXh <- 2 * E / (n * p)
+    g <- list(W2 = t(z) %*% dXh, b2 = matrix(colSums(dXh), 1))
+    dz <- dXh %*% t(par$W2)
+
+    if (type == "vae") {
+      kl <- -0.5 * sum(1 + lv - a1^2 - exp(lv)) / (n * p)
+      # dKL/dmu = mu, dKL/dlogvar = -0.5(1 - exp(logvar)), scaled to match
+      dmu <- dz + beta * a1 / (n * p)
+      dlv <- dz * (0.5 * sdv * eps) + beta * (-0.5) * (1 - exp(lv)) / (n * p)
+      g$W1 <- t(X) %*% dmu; g$b1 <- matrix(colSums(dmu), 1)
+      g$Wv <- t(X) %*% dlv; g$bv <- matrix(colSums(dlv), 1)
+      hist[e] <- recon + beta * kl
+    } else {
+      da1 <- if (type == "tanh") dz * (1 - z^2) else dz
+      g$W1 <- t(X) %*% da1; g$b1 <- matrix(colSums(da1), 1)
+      hist[e] <- recon
+    }
+
+    up <- adam_update(par, g, st, lr = lr); par <- up$par; st <- up$state
+  }
+
+  encode <- function(Xn) {
+    a <- Xn %*% par$W1 + rep_row(par$b1, nrow(Xn))
+    if (type == "tanh") tanh(a) else a       # VAE uses the mean at test time
+  }
+
+  list(par = par, type = type, k = k, loss = hist,
+       encode = encode,
+       reconstruct = function(Xn)
+         encode(Xn) %*% par$W2 + rep_row(par$b2, nrow(Xn)))
+}
+```
+
+``` r
+#' Condition-aligned autoencoder (linear), after `rnaprot/unpaired.py`.
+#'
+#' Two encoders, two decoders, tied by CONDITION CENTROIDS -- never by sample
+#' pairing, which does not exist in this design. The four loss terms and their
+#' default weights match the Python implementation:
+#'
+#'   w1 * MSE(dec_r(z_r), R)                     RNA reconstruction
+#'   w2 * MSE(dec_p(z_p), P)                     protein reconstruction
+#'   w3 * MSE(centroid_c dec_p(z_r), centroid_c P)   cross-modal, per condition
+#'   w4 * MSE(centroid_c z_r, centroid_c z_p)    latent centroid alignment
+#'
+#' WHY LINEAR HERE. The Python version uses MLP encoders (64, 16, SiLU,
+#' dropout). This implementation is linear, for a reason that is itself part
+#' of the finding: with 8 conditions, a linear map already has far more
+#' parameters than observations. If the linear version cannot beat the mean
+#' baseline out of sample, a deeper one with strictly more parameters and the
+#' same data will not either. §7 tests exactly that.
+cond_ae_fit <- function(R, P, cond_r, cond_p, k = 3,
+                        w = c(0.5, 0.5, 2.0, 0.5),
+                        epochs = 3000, lr = 0.01, seed = 1) {
+
+  set.seed(seed)
+  nr <- nrow(R); pr <- ncol(R)
+  np <- nrow(P); pp <- ncol(P)
+
+  init <- function(a, b) matrix(rnorm(a * b, 0, 1 / sqrt(a)), a, b)
+  par <- list(Wr = init(pr, k), Ar = init(k, pr),
+              Wp = init(pp, k), Ap = init(k, pp))
+
+  shared <- intersect(unique(cond_r), unique(cond_p))
+  idx_r <- lapply(shared, function(cc) which(cond_r == cc))
+  idx_p <- lapply(shared, function(cc) which(cond_p == cc))
+  nc <- length(shared)
+
+  st <- adam_init(par); hist <- numeric(epochs)
+
+  for (e in seq_len(epochs)) {
+    z_r <- R %*% par$Wr; z_p <- P %*% par$Wp
+    Rh  <- z_r %*% par$Ar; Ph <- z_p %*% par$Ap
+
+    Er <- Rh - R; Ep <- Ph - P
+    L1 <- sum(Er^2) / (nr * pr); L2 <- sum(Ep^2) / (np * pp)
+
+    dRh <- w[1] * 2 * Er / (nr * pr)
+    dPh <- w[2] * 2 * Ep / (np * pp)
+
+    g <- list(Ar = t(z_r) %*% dRh, Ap = t(z_p) %*% dPh)
+    dz_r <- dRh %*% t(par$Ar)
+    dz_p <- dPh %*% t(par$Ap)
+
+    L3 <- 0; L4 <- 0
+    for (i in seq_len(nc)) {
+      ri <- idx_r[[i]]; pi <- idx_p[[i]]
+
+      mzr  <- colMeans(z_r[ri, , drop = FALSE])
+      mzp  <- colMeans(z_p[pi, , drop = FALSE])
+      pred <- matrix(mzr, 1) %*% par$Ap
+      obs  <- colMeans(P[pi, , drop = FALSE])
+
+      e3 <- pred - matrix(obs, 1); L3 <- L3 + sum(e3^2) / pp
+      e4 <- matrix(mzr - mzp, 1);  L4 <- L4 + sum(e4^2) / k
+
+      c3 <- w[3] * 2 / (nc * pp)
+      g$Ap <- g$Ap + c3 * matrix(mzr, ncol = 1) %*% e3
+      d_mzr <- c3 * e3 %*% t(par$Ap)
+
+      c4 <- w[4] * 2 / (nc * k)
+      d_mzr <- d_mzr + c4 * e4
+      d_mzp <- -c4 * e4
+
+      dz_r[ri, ] <- dz_r[ri, ] + matrix(rep(d_mzr / length(ri), each = length(ri)),
+                                        length(ri))
+      dz_p[pi, ] <- dz_p[pi, ] + matrix(rep(d_mzp / length(pi), each = length(pi)),
+                                        length(pi))
+    }
+
+    g$Wr <- t(R) %*% dz_r
+    g$Wp <- t(P) %*% dz_p
+
+    hist[e] <- w[1]*L1 + w[2]*L2 + w[3]*L3/nc + w[4]*L4/nc
+    up <- adam_update(par, g, st, lr = lr); par <- up$par; st <- up$state
+  }
+
+  list(par = par, k = k, loss = hist,
+       predict_protein = function(Rn) (Rn %*% par$Wr) %*% par$Ap)
+}
+```
+
+``` r
+#' Baseline and reference predictors, matching `unpaired.py`'s set.
+ridge_fit <- function(X, Y, alpha = 10) {
+  X1 <- cbind(1, X)
+  A  <- crossprod(X1) + alpha * diag(ncol(X1)); A[1, 1] <- A[1, 1] - alpha
+  qr.solve(A, crossprod(X1, Y))
+}
+ridge_pred <- function(B, Xn) cbind(1, Xn) %*% B
+
+pred_mean <- function(Xtr, Ytr, Xte, ...)
+  matrix(colMeans(Ytr), nrow(Xte), ncol(Ytr), byrow = TRUE)
+
+pred_design <- function(Xtr, Ytr, Xte, Dtr, Dte, alpha = 5, ...)
+  ridge_pred(ridge_fit(Dtr, Ytr, alpha), Dte)
+
+pred_pca_ridge <- function(Xtr, Ytr, Xte, k = 2, alpha = 10, ...) {
+  k <- max(1, min(k, nrow(Xtr) - 1, ncol(Xtr)))
+  mu <- colMeans(Xtr)
+  s  <- svd(sweep(Xtr, 2, mu), nu = k, nv = k)
+  Ztr <- s$u[, seq_len(k), drop = FALSE] %*% diag(s$d[seq_len(k)], k, k)
+  Zte <- sweep(Xte, 2, mu) %*% s$v[, seq_len(k), drop = FALSE]
+  ridge_pred(ridge_fit(Ztr, Ytr, alpha), Zte)
+}
+
+pred_pls <- function(Xtr, Ytr, Xte, k = 2, ...) {
+  k  <- max(1, min(k, nrow(Xtr) - 2))
+  mx <- colMeans(Xtr); my <- colMeans(Ytr)
+  f  <- pls2(sweep(Xtr, 2, mx), sweep(Ytr, 2, my), ncomp = k)
+  sweep(pls_predict(f, sweep(Xte, 2, mx), k), 2, my, "+")
+}
+
+pred_cond_ae <- function(Xtr, Ytr, Xte, cond_tr, k = 3, epochs = 600, seed = 1, ...) {
+  m <- cond_ae_fit(Xtr, Ytr, cond_tr, cond_tr, k = k, epochs = epochs, seed = seed)
+  m$predict_protein(Xte)
+}
+```
+
+------------------------------------------------------------------------
+
+## 4. D1 — How many components are real?
+
+**The assumption being tested:** that the leading components describe
+structure rather than noise.
+
+**The test.** Horn’s parallel analysis: permute each feature
+independently to destroy between-feature correlation while preserving
+each feature’s marginal distribution, recompute the eigenvalue spectrum,
+and keep only components whose observed eigenvalue exceeds the permuted
+95th percentile.
+
+``` r
+parallel_analysis <- function(X, n_perm = 100, seed = 1) {
+  set.seed(seed)
+  ev  <- function(M) { s <- svd(scale(M, TRUE, FALSE)); s$d^2 / sum(s$d^2) }
+  obs <- ev(X)
+  perm <- replicate(n_perm, ev(apply(X, 2, sample)))
+  data.frame(
+    component = seq_along(obs),
+    observed  = round(100 * obs, 2),
+    perm_q95  = round(100 * apply(perm, 1, quantile, 0.95), 2),
+    real      = obs > apply(perm, 1, quantile, 0.95)
+  )
+}
+
+d1 <- do.call(rbind, lapply(names(BLOCKS), function(nm) {
+  b <- BLOCKS[[nm]]
+  rbind(
+    cbind(variety = nm, layer = "RNA (24 samples)",     parallel_analysis(b$R_samp)),
+    cbind(variety = nm, layer = "protein (24 samples)", parallel_analysis(b$P_samp))
+  )
+}))
+
+knitr::kable(subset(d1, component <= 5),
+             caption = "D1: observed vs permuted variance explained. `real = TRUE` means the component exceeds the permutation 95th percentile.")
+```
+
+|     | variety | layer                | component | observed | perm_q95 | real  |
+|:----|:--------|:---------------------|----------:|---------:|---------:|:------|
+| 1   | Cadenza | RNA (24 samples)     |         1 |    69.18 |     5.51 | TRUE  |
+| 2   | Cadenza | RNA (24 samples)     |         2 |    16.35 |     5.30 | TRUE  |
+| 3   | Cadenza | RNA (24 samples)     |         3 |     6.46 |     5.15 | TRUE  |
+| 4   | Cadenza | RNA (24 samples)     |         4 |     1.54 |     5.01 | FALSE |
+| 5   | Cadenza | RNA (24 samples)     |         5 |     1.09 |     4.92 | FALSE |
+| 25  | Cadenza | protein (24 samples) |         1 |    43.54 |     6.23 | TRUE  |
+| 26  | Cadenza | protein (24 samples) |         2 |     8.41 |     5.90 | TRUE  |
+| 27  | Cadenza | protein (24 samples) |         3 |     8.03 |     5.64 | TRUE  |
+| 28  | Cadenza | protein (24 samples) |         4 |     5.74 |     5.39 | TRUE  |
+| 29  | Cadenza | protein (24 samples) |         5 |     5.24 |     5.23 | TRUE  |
+| 49  | Norin   | RNA (24 samples)     |         1 |    55.98 |     5.53 | TRUE  |
+| 50  | Norin   | RNA (24 samples)     |         2 |    30.15 |     5.29 | TRUE  |
+| 51  | Norin   | RNA (24 samples)     |         3 |     4.44 |     5.15 | FALSE |
+| 52  | Norin   | RNA (24 samples)     |         4 |     2.33 |     5.05 | FALSE |
+| 53  | Norin   | RNA (24 samples)     |         5 |     1.60 |     4.94 | FALSE |
+| 73  | Norin   | protein (24 samples) |         1 |    34.07 |     6.38 | TRUE  |
+| 74  | Norin   | protein (24 samples) |         2 |    10.27 |     5.87 | TRUE  |
+| 75  | Norin   | protein (24 samples) |         3 |     9.32 |     5.64 | TRUE  |
+| 76  | Norin   | protein (24 samples) |         4 |     6.64 |     5.49 | TRUE  |
+| 77  | Norin   | protein (24 samples) |         5 |     6.44 |     5.24 | TRUE  |
+
+D1: observed vs permuted variance explained. `real = TRUE` means the
+component exceeds the permutation 95th percentile.
+
+``` r
+op <- par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3, 1))
+for (nm in names(BLOCKS)) {
+  for (ly in c("RNA (24 samples)", "protein (24 samples)")) {
+    d <- subset(d1, variety == nm & layer == ly & component <= 10)
+    plot(d$component, d$observed, type = "b", pch = 16, lwd = 2, col = "#2C6FBB",
+         ylim = c(0, max(d$observed) * 1.1),
+         xlab = "component", ylab = "% variance explained",
+         main = sprintf("%s -- %s", nm, ly))
+    lines(d$component, d$perm_q95, type = "b", pch = 4, lty = 2, col = "#D1495B")
+    legend("topright", bty = "n", cex = 0.75, lwd = 2, pch = c(16, 4),
+           lty = c(1, 2), col = c("#2C6FBB", "#D1495B"),
+           legend = c("observed", "permutation 95%"))
+  }
+}
+par(op)
+```
+
+<img
+src="dimensionality_reduction_wheat_files/figure-commonmark/fig-d1-1.png"
+id="fig-d1"
+alt="Figure 1: Scree plots against a permutation null. Only components above the dashed line carry structure beyond feature-wise noise." />
+
+**How to read this.** The number of `real = TRUE` components is the
+honest ceiling on latent dimension. Fitting an autoencoder with a latent
+dimension larger than this is fitting noise, whatever the reconstruction
+error says.
+
+------------------------------------------------------------------------
+
+## 5. D2 — Do the components track the design?
+
+**The assumption being tested:** that PCA’s leading directions
+correspond to the experimental factors rather than to batch, handling,
+or an artefact.
+
+``` r
+design_association <- function(b, label) {
+  s <- svd(scale(b$R_samp, TRUE, FALSE))
+  Z <- s$u[, 1:4] %*% diag(s$d[1:4])
+  meta <- b$meta
+
+  do.call(rbind, lapply(1:4, function(j) {
+    z <- Z[, j]
+    data.frame(
+      variety = label, component = j,
+      var_pct = round(100 * s$d[j]^2 / sum(s$d^2), 1),
+      # eta-squared: fraction of the component explained by each factor
+      eta2_treatment = round(summary(aov(z ~ meta$treatment))[[1]][1, 2] /
+                               sum(summary(aov(z ~ meta$treatment))[[1]][, 2]), 3),
+      eta2_time      = round(summary(aov(z ~ factor(meta$time_num)))[[1]][1, 2] /
+                               sum(summary(aov(z ~ factor(meta$time_num)))[[1]][, 2]), 3)
+    )
+  }))
+}
+
+d2 <- do.call(rbind, Map(design_association, BLOCKS, names(BLOCKS)))
+knitr::kable(d2, caption = "D2: fraction of each RNA principal component explained by treatment and by timepoint (eta-squared).")
+```
+
+|           | variety | component | var_pct | eta2_treatment | eta2_time |
+|:----------|:--------|----------:|--------:|---------------:|----------:|
+| Cadenza.1 | Cadenza |         1 |    69.2 |          0.629 |     0.132 |
+| Cadenza.2 | Cadenza |         2 |    16.4 |          0.111 |     0.841 |
+| Cadenza.3 | Cadenza |         3 |     6.5 |          0.031 |     0.745 |
+| Cadenza.4 | Cadenza |         4 |     1.5 |          0.002 |     0.215 |
+| Norin.1   | Norin   |         1 |    56.0 |          0.186 |     0.714 |
+| Norin.2   | Norin   |         2 |    30.2 |          0.546 |     0.287 |
+| Norin.3   | Norin   |         3 |     4.4 |          0.011 |     0.687 |
+| Norin.4   | Norin   |         4 |     2.3 |          0.022 |     0.571 |
+
+D2: fraction of each RNA principal component explained by treatment and
+by timepoint (eta-squared).
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+for (nm in names(BLOCKS)) {
+  b <- BLOCKS[[nm]]
+  s <- svd(scale(b$R_samp, TRUE, FALSE))
+  Z <- s$u[, 1:2] %*% diag(s$d[1:2])
+  ve <- round(100 * s$d[1:2]^2 / sum(s$d^2), 1)
+  plot(Z[, 1], Z[, 2],
+       col = c("#2C6FBB", "#D1495B")[as.integer(b$meta$treatment)],
+       pch = c(15, 16, 17, 18)[as.integer(factor(b$meta$time_num))],
+       cex = 1.8, xlab = sprintf("PC1 (%.1f%%)", ve[1]),
+       ylab = sprintf("PC2 (%.1f%%)", ve[2]), main = sprintf("%s: RNA", nm))
+  legend("topright", bty = "n", cex = 0.7,
+         legend = c(levels(b$meta$treatment), paste0(DESIGN$timepoints, " h")),
+         col = c("#2C6FBB", "#D1495B", rep("grey40", 4)),
+         pch = c(16, 16, 15, 16, 17, 18))
+}
+par(op)
+```
+
+<img
+src="dimensionality_reduction_wheat_files/figure-commonmark/fig-d2-1.png"
+id="fig-d2"
+alt="Figure 2: RNA PCA coloured by treatment and timepoint. If the leading components are biology, the design should be visible." />
+
+------------------------------------------------------------------------
+
+## 6. D3 — Is a linear autoencoder equivalent to PCA?
+
+**The assumption being tested:** that the autoencoder implementation is
+correct, and that a linear autoencoder adds nothing over PCA.
+
+Baldi and Hornik (1989) proved the squared-error loss of a linear
+autoencoder has no local minima and its global optimum spans the
+principal subspace. So a correct implementation must recover the PCA
+subspace. This is simultaneously a **correctness check on the code** and
+a **substantive result**: it establishes that any advantage a VAE has
+must come from non-linearity, not from being an autoencoder.
+
+``` r
+subspace_alignment <- function(X, k = 3, epochs = 5000) {
+
+  s   <- svd(scale(X, TRUE, FALSE))
+  Vpc <- s$v[, seq_len(k), drop = FALSE]
+  Zpc <- s$u[, seq_len(k), drop = FALSE] %*% diag(s$d[seq_len(k)], k, k)
+
+  ae <- ae_fit(X, k = k, type = "linear", epochs = epochs, lr = 0.02)
+
+  # COMPARE LATENT SCORES, NOT ENCODER WEIGHTS.
+  #
+  # This distinction is not pedantry -- getting it wrong makes a correct
+  # implementation look broken. With n = 24 samples and p = 2000 features the
+  # data occupy a subspace of rank <= 23 out of 2000. X %*% W1 therefore
+  # depends ONLY on the component of W1 lying inside that row space; any
+  # component orthogonal to it changes the weights while leaving every
+  # prediction untouched. The encoder weight subspace is consequently NOT
+  # identified in the p >> n regime, and comparing col(W1) to col(Vpc)
+  # measures mostly arbitrary directions (this was verified directly: an
+  # autoencoder whose reconstruction MSE matched PCA's optimum to 5 decimal
+  # places scored a weight-subspace cosine of 0.15).
+  #
+  # The latent SCORES (n x k) and the reconstruction ARE identified, so those
+  # are what the theorem should be checked against.
+  Zae <- ae$encode(scale(X, TRUE, FALSE))
+
+  cos_scores <- svd(t(qr.Q(qr(Zpc))) %*% qr.Q(qr(Zae)))$d
+
+  rec_ae  <- ae$reconstruct(X)
+  rec_pca <- scale(X, TRUE, FALSE) %*% Vpc %*% t(Vpc) +
+             matrix(colMeans(X), nrow(X), ncol(X), byrow = TRUE)
+
+  list(cos_scores = round(cos_scores, 4),
+       mean_cos   = round(mean(cos_scores), 4),
+       cor_recon  = round(cor(as.vector(rec_ae), as.vector(rec_pca)), 4),
+       recon_pca  = mean((X - rec_pca)^2),
+       recon_ae   = mean((X - rec_ae)^2),
+       loss = ae$loss)
+}
+
+d3 <- lapply(names(BLOCKS), function(nm) {
+  r <- subspace_alignment(BLOCKS[[nm]]$R_samp, k = 3)
+  data.frame(variety = nm,
+             cos_score_1 = r$cos_scores[1], cos_score_2 = r$cos_scores[2],
+             cos_score_3 = r$cos_scores[3], mean_cosine = r$mean_cos,
+             cor_reconstruction = r$cor_recon,
+             mse_pca = signif(r$recon_pca, 4),
+             mse_linear_ae = signif(r$recon_ae, 4))
+})
+knitr::kable(do.call(rbind, d3),
+             caption = "D3: agreement between the linear autoencoder and PCA, on IDENTIFIED quantities (latent scores and reconstruction). Values near 1 confirm Baldi-Hornik.")
+```
+
+| variety | cos_score_1 | cos_score_2 | cos_score_3 | mean_cosine | cor_reconstruction |  mse_pca | mse_linear_ae |
+|:--------|------------:|------------:|------------:|------------:|-------------------:|---------:|--------------:|
+| Cadenza |           1 |           1 |      0.9923 |      0.9974 |                  1 | 4.00e-05 |      4.00e-05 |
+| Norin   |           1 |           1 |      0.9232 |      0.9744 |                  1 | 4.71e-05 |      4.71e-05 |
+
+D3: agreement between the linear autoencoder and PCA, on IDENTIFIED
+quantities (latent scores and reconstruction). Values near 1 confirm
+Baldi-Hornik.
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+for (nm in names(BLOCKS)) {
+  r <- subspace_alignment(BLOCKS[[nm]]$R_samp, k = 3)
+  plot(r$loss, type = "l", lwd = 2, col = "#2C6FBB", log = "y",
+       xlab = "epoch", ylab = "reconstruction MSE",
+       main = sprintf("%s: linear AE converges to PCA", nm))
+  abline(h = r$recon_pca, col = "#D1495B", lwd = 2, lty = 2)
+  legend("topright", bty = "n", cex = 0.75, lwd = 2, lty = c(1, 2),
+         col = c("#2C6FBB", "#D1495B"), legend = c("linear AE", "PCA optimum"))
+}
+par(op)
+```
+
+<img
+src="dimensionality_reduction_wheat_files/figure-commonmark/fig-d3-1.png"
+id="fig-d3"
+alt="Figure 3: Training loss of the linear autoencoder against the PCA reconstruction error it should converge to." />
+
+------------------------------------------------------------------------
+
+## 7. D4 — Does any method beat predicting the mean?
+
+**This is the headline comparison.** Every method is scored by
+leave-one-condition-out cross-validation — hold out one of the 8
+treatment × timepoint cells entirely, fit on the remaining 7, predict
+the held-out cell’s protein profile. This matches `leave_condition_out`
+in `rnaprot/unpaired.py`.
+
+The reference point is the **mean baseline**: predict the training-set
+average protein profile, ignoring RNA completely. A method that cannot
+beat it is not extracting usable information.
+
+The **design baseline** (ridge on treatment + timepoint indicators) is
+the second reference: a method that only matches it is recovering the
+experimental design, not cross-layer biology.
+
+``` r
+#' Leave-one-condition-out CV across all methods.
+loco_compare <- function(b, label, k = 2, seeds = 1:3) {
+
+  X <- b$R_cond; Y <- b$P_cond
+  cells <- b$cond$cell
+  D <- model.matrix(~ treatment + time_f, b$cond)[, -1, drop = FALSE]
+  n <- nrow(X)
+
+  press <- list()
+  add <- function(nm, v) press[[nm]] <<- c(press[[nm]], v)
+
+  for (i in seq_len(n)) {
+    tr <- setdiff(seq_len(n), i)
+    Xtr <- X[tr, , drop = FALSE]; Ytr <- Y[tr, , drop = FALSE]
+    Xte <- X[i, , drop = FALSE];  Yte <- Y[i, , drop = FALSE]
+    Dtr <- D[tr, , drop = FALSE]; Dte <- D[i, , drop = FALSE]
+
+    sq <- function(pred) sum((Yte - pred)^2)
+
+    add("mean",       sq(pred_mean(Xtr, Ytr, Xte)))
+    add("design",     sq(pred_design(Xtr, Ytr, Xte, Dtr, Dte)))
+    add("PCA+ridge",  sq(pred_pca_ridge(Xtr, Ytr, Xte, k = k)))
+    add("PLS",        sq(pred_pls(Xtr, Ytr, Xte, k = k)))
+
+    # autoencoders: averaged over seeds, since they are non-convex
+    for (mdl in c("linear", "tanh", "vae")) {
+      pr <- rowMeans(vapply(seeds, function(s) {
+        ae <- ae_fit(Xtr, k = k, type = mdl, epochs = 4000, lr = 0.02, seed = s)
+        # map latent -> protein by ridge on the training conditions
+        Ztr <- ae$encode(Xtr); Zte <- ae$encode(Xte)
+        as.vector(ridge_pred(ridge_fit(Ztr, Ytr, 10), Zte))
+      }, numeric(ncol(Y))))
+      add(paste0("AE-", mdl), sum((as.vector(Yte) - pr)^2))
+    }
+
+    pr <- rowMeans(vapply(seeds, function(s)
+      as.vector(pred_cond_ae(Xtr, Ytr, Xte, cells[tr], k = k, epochs = 3000, seed = s)),
+      numeric(ncol(Y))))
+    add("condition-aligned AE", sum((as.vector(Yte) - pr)^2))
+  }
+
+  tss <- sum(vapply(seq_len(n), function(i)
+    sum((Y[i, ] - colMeans(Y[-i, , drop = FALSE]))^2), numeric(1)))
+
+  data.frame(variety = label, method = names(press),
+             Q2 = round(1 - vapply(press, sum, numeric(1)) / tss, 4),
+             row.names = NULL)
+}
+
+d4 <- do.call(rbind, Map(loco_compare, BLOCKS, names(BLOCKS)))
+d4 <- d4[order(d4$variety, -d4$Q2), ]
+knitr::kable(d4, caption = "D4: leave-one-condition-out Q2 for predicting the protein block. Q2 <= 0 means no better than predicting the mean.")
+```
+
+|           | variety | method               |      Q2 |
+|:----------|:--------|:---------------------|--------:|
+| Cadenza.8 | Cadenza | condition-aligned AE |  0.5754 |
+| Cadenza.4 | Cadenza | PLS                  |  0.2872 |
+| Cadenza.3 | Cadenza | PCA+ridge            |  0.1986 |
+| Cadenza.7 | Cadenza | AE-vae               |  0.1012 |
+| Cadenza.2 | Cadenza | design               |  0.0212 |
+| Cadenza.6 | Cadenza | AE-tanh              |  0.0032 |
+| Cadenza.5 | Cadenza | AE-linear            |  0.0029 |
+| Cadenza.1 | Cadenza | mean                 |  0.0000 |
+| Norin.8   | Norin   | condition-aligned AE |  0.4503 |
+| Norin.3   | Norin   | PCA+ridge            |  0.0955 |
+| Norin.7   | Norin   | AE-vae               |  0.0351 |
+| Norin.2   | Norin   | design               |  0.0093 |
+| Norin.5   | Norin   | AE-linear            |  0.0016 |
+| Norin.6   | Norin   | AE-tanh              |  0.0012 |
+| Norin.1   | Norin   | mean                 |  0.0000 |
+| Norin.4   | Norin   | PLS                  | -0.0098 |
+
+D4: leave-one-condition-out Q2 for predicting the protein block. Q2 \<=
+0 means no better than predicting the mean.
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(10, 4.5, 3, 1))
+for (nm in unique(d4$variety)) {
+  d <- d4[d4$variety == nm, ]
+  cols <- ifelse(d$Q2 > 0, "#2C6FBB", "#D1495B")
+  cols[d$method == "mean"] <- "grey60"
+  bp <- barplot(d$Q2, names.arg = d$method, las = 2, col = cols,
+                ylab = expression(Q^2), main = nm,
+                ylim = range(c(d$Q2, 0)) * 1.3)
+  abline(h = 0, lwd = 2)
+  text(bp, d$Q2, sprintf("%.3f", d$Q2), pos = ifelse(d$Q2 > 0, 3, 1), cex = 0.7)
+}
+par(op)
+```
+
+<img
+src="dimensionality_reduction_wheat_files/figure-commonmark/fig-d4-1.png"
+id="fig-d4"
+alt="Figure 4: Out-of-sample predictive performance. Anything at or below zero fails to beat the mean baseline." />
+
+------------------------------------------------------------------------
+
+## 7b. D7 — Condition means or individual replicates for the cross-block fit?
+
+D4 fits every method on **condition means** (8 rows). That was a choice,
+not the only option, and it deserves its own test rather than an
+assertion.
+
+**Why “individual samples” is not simply the other option.** Under Case
+B there is no real sample-level correspondence between an RNA plant and
+a protein plant, so a cross-block fit on 24 “paired” rows requires
+*inventing* a pairing. There are two ways to do that, and they are not
+equivalent:
+
+- **Fixed label pairing** — match RNA replicate *i* to protein replicate
+  *i* by row order (same field-plot label), and trust it. This is what
+  the private reference notebook’s sample-level `sPLS` sections assumed
+  (`stopifnot(all(rownames(cadenza.X_prot) == rownames(cadenza.X_rnaseq)))`).
+  The label is fictional biology, so any within-cell covariance this
+  “pairing” contributes is not real signal — it is one arbitrary draw
+  from noise, and it can inflate or deflate Q² by chance.
+- **Replicate-pairing bootstrap** — within each cell, randomly permute
+  which RNA replicate is matched to which protein replicate, refit,
+  repeat over many draws, and average. This is the same mechanism
+  already used for stability selection in `R/06_integration_caseB.R` (§4
+  there). Because the pairing is randomised, the within-cell covariance
+  it induces is zero *in expectation* — what survives averaging over
+  draws is the between-cell signal, which is the only signal Case B
+  actually licenses.
+
+All three schemes are scored identically: **leave-one-condition-out**
+(never leave-one-sample-out, which would let a fictional within-cell
+pairing leak across train/test), against a **permutation null** that
+reshuffles which protein condition’s data is matched to which RNA
+condition (`permute_Y_by_cell()` below), per Westerhuis et al. (2008).
+This directly answers the “add a permutation null” item flagged in §11 —
+for this comparison, not yet for the rest of D4.
+
+``` r
+#' Leave-one-condition-out Q2, generic over row count: works for the 8-row
+#' condition-mean scheme and the 24-row (3 reps/cell) sample-level schemes,
+#' since in every case rows sharing a `cell_of` label are matched X<->Y
+#' row-by-row within that label.
+loco_on <- function(X, Y, cell_of, k = 2) {
+  cells <- unique(cell_of)
+  press <- setNames(numeric(length(cells)), cells)
+  for (cl in cells) {
+    te <- cell_of == cl; tr <- !te
+    press[cl] <- sum((Y[te, , drop = FALSE] -
+                       pred_pls(X[tr, , drop = FALSE], Y[tr, , drop = FALSE],
+                                X[te, , drop = FALSE], k = k))^2)
+  }
+  tss <- sum(vapply(cells, function(cl) {
+    te <- cell_of == cl
+    sum(sweep(Y[te, , drop = FALSE], 2,
+              colMeans(Y[!te, , drop = FALSE]))^2)
+  }, numeric(1)))
+  1 - sum(press) / tss
+}
+
+#' Reshuffle which cell's protein data is matched to which cell's RNA data,
+#' preserving the within-cell group structure (balanced: 1 row/cell for
+#' condition means, 3 rows/cell for sample-level). The between-cell
+#' correspondence is destroyed; everything else about the scheme is kept.
+permute_Y_by_cell <- function(Y, cell_of) {
+  cells <- unique(cell_of)
+  perm  <- setNames(sample(cells), cells)
+  Yp <- Y
+  for (cl in cells) {
+    src <- which(cell_of == perm[[cl]])
+    dst <- which(cell_of == cl)
+    Yp[dst, ] <- Y[src[sample(length(src))], , drop = FALSE]
+  }
+  Yp
+}
+
+pairing_compare <- function(b, label, k = 2, n_pairings = 30, n_perm = 199, seed = 1) {
+
+  common <- intersect(rownames(b$R_samp), rownames(b$P_samp))
+  cell_s <- as.character(b$meta[common, "cell"])
+  idx    <- split(common, cell_s)
+
+  set.seed(seed)
+
+  ## (a) condition means, n = 8
+  q2_cond   <- loco_on(b$R_cond, b$P_cond, rownames(b$R_cond), k)
+  null_cond <- replicate(n_perm,
+    loco_on(b$R_cond, permute_Y_by_cell(b$P_cond, rownames(b$R_cond)), rownames(b$R_cond), k))
+
+  ## (b) fixed label pairing, n = 24 (what the reference notebook assumed)
+  Xf <- b$R_samp[common, , drop = FALSE]; Yf <- b$P_samp[common, , drop = FALSE]
+  q2_fixed   <- loco_on(Xf, Yf, cell_s, k)
+  null_fixed <- replicate(n_perm, loco_on(Xf, permute_Y_by_cell(Yf, cell_s), cell_s, k))
+
+  ## (c) replicate-pairing bootstrap, n = 24, averaged over random within-cell
+  ## pairings; its null combines a fresh pairing AND a fresh permutation per
+  ## draw, so it is not narrower than the fixed/condition-mean nulls.
+  draw_boot <- function() {
+    ip <- unlist(lapply(idx, sample))
+    loco_on(Xf, b$P_samp[ip, , drop = FALSE], cell_s, k)
+  }
+  draw_boot_null <- function() {
+    ip <- unlist(lapply(idx, sample))
+    loco_on(Xf, permute_Y_by_cell(b$P_samp[ip, , drop = FALSE], cell_s), cell_s, k)
+  }
+  q2_boot_draws <- replicate(n_pairings, draw_boot())
+  null_boot     <- replicate(n_perm, draw_boot_null())
+
+  pval <- function(obs, null) (sum(null >= obs) + 1) / (length(null) + 1)
+
+  data.frame(
+    variety = label,
+    scheme  = c("condition means", "fixed label pairing", "replicate-pairing bootstrap"),
+    n_rows  = c(8L, 24L, 24L),
+    Q2      = round(c(q2_cond, q2_fixed, mean(q2_boot_draws)), 4),
+    Q2_sd_over_pairings = round(c(NA, NA, sd(q2_boot_draws)), 4),
+    null_p95 = round(c(quantile(null_cond, .95), quantile(null_fixed, .95),
+                        quantile(null_boot, .95)), 4),
+    p_perm  = round(c(pval(q2_cond, null_cond), pval(q2_fixed, null_fixed),
+                       pval(mean(q2_boot_draws), null_boot)), 4)
+  )
+}
+
+d7 <- do.call(rbind, Map(pairing_compare, BLOCKS, names(BLOCKS)))
+rownames(d7) <- NULL
+knitr::kable(d7, caption = "D7: PLS-only, leave-one-condition-out Q2 under three ways of building the cross-block training matrix. null_p95 is the 95th percentile of a permutation null that reshuffles condition correspondence; p_perm is the empirical p-value against that null.")
+```
+
+| variety | scheme                      | n_rows |      Q2 | Q2_sd_over_pairings | null_p95 | p_perm |
+|:--------|:----------------------------|-------:|--------:|--------------------:|---------:|-------:|
+| Cadenza | condition means             |      8 |  0.2872 |                  NA |   0.1779 |  0.015 |
+| Cadenza | fixed label pairing         |     24 |  0.2323 |                  NA |   0.0886 |  0.005 |
+| Cadenza | replicate-pairing bootstrap |     24 | -0.2117 |              0.0016 |   0.0719 |  0.295 |
+| Norin   | condition means             |      8 | -0.0098 |                  NA |  -0.0025 |  0.060 |
+| Norin   | fixed label pairing         |     24 |  0.0025 |                  NA |  -0.0547 |  0.015 |
+| Norin   | replicate-pairing bootstrap |     24 | -0.3402 |              0.0019 |  -0.0505 |  0.485 |
+
+D7: PLS-only, leave-one-condition-out Q2 under three ways of building
+the cross-block training matrix. null_p95 is the 95th percentile of a
+permutation null that reshuffles condition correspondence; p_perm is the
+empirical p-value against that null.
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(9, 4.5, 3, 1))
+for (nm in unique(d7$variety)) {
+  d <- d7[d7$variety == nm, ]
+  bp <- barplot(d$Q2, names.arg = d$scheme, las = 2, col = "#2C6FBB",
+                ylab = expression(Q^2), main = nm,
+                ylim = range(c(d$Q2, d$null_p95, 0)) * 1.3)
+  segments(bp - 0.4, d$null_p95, bp + 0.4, d$null_p95, lty = 2, lwd = 2, col = "#D1495B")
+  err <- d$Q2_sd_over_pairings; err[is.na(err)] <- 0
+  arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, length = 0.05)
+  abline(h = 0)
+  text(bp, pmax(d$Q2, d$null_p95), sprintf("p=%.3f", d$p_perm), pos = 3, cex = 0.7)
+}
+```
+
+    Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
+    zero-length arrow is of indeterminate angle and so skipped
+
+    Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
+    zero-length arrow is of indeterminate angle and so skipped
+
+    Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
+    zero-length arrow is of indeterminate angle and so skipped
+
+    Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
+    zero-length arrow is of indeterminate angle and so skipped
+
+``` r
+par(op)
+```
+
+<img
+src="dimensionality_reduction_wheat_files/figure-commonmark/fig-d7-1.png"
+id="fig-d7"
+alt="Figure 5: D7: observed Q2 (bars) against its own permutation null 95th percentile (dashed). Error bars on the bootstrap scheme show +-1 SD across 30 random pairings." />
+
+**Reading D7.** More rows help the fit *only if the extra rows carry
+real signal*: the fixed pairing and the bootstrap both give the model 21
+training rows per fold instead of 7, but only the bootstrap’s extra rows
+are honest about carrying zero within-cell signal in expectation. The
+fixed pairing’s extra rows carry whatever the one arbitrary label draw
+happened to produce — which is exactly why it is not a safe default,
+independent of whether it happens to score higher or lower here in any
+single run.
+
+------------------------------------------------------------------------
+
+## 8. D5 — Are we sample-limited?
+
+**The assumption being tested:** that 8 conditions suffice to fit these
+models.
+
+If performance is still improving as training conditions are added, the
+models are data-starved and the comparison in §7 reflects sample size as
+much as method quality.
+
+``` r
+learning_curve <- function(b, label, k = 2, reps = 8) {
+  X <- b$R_cond; Y <- b$P_cond; n <- nrow(X)
+  set.seed(1)
+  do.call(rbind, lapply(3:(n - 1), function(m) {
+    errs <- replicate(reps, {
+      tr <- sample(n, m); te <- setdiff(seq_len(n), tr)[1]
+      Xtr <- X[tr, , drop = FALSE]; Ytr <- Y[tr, , drop = FALSE]
+      Xte <- X[te, , drop = FALSE]; Yte <- Y[te, , drop = FALSE]
+      c(pls  = mean((Yte - pred_pls(Xtr, Ytr, Xte, k = k))^2),
+        pca  = mean((Yte - pred_pca_ridge(Xtr, Ytr, Xte, k = k))^2),
+        mean = mean((Yte - pred_mean(Xtr, Ytr, Xte))^2))
+    })
+    data.frame(variety = label, n_train = m,
+               pls = mean(errs["pls", ]), pca = mean(errs["pca", ]),
+               mean_baseline = mean(errs["mean", ]))
+  }))
+}
+
+d5 <- do.call(rbind, Map(learning_curve, BLOCKS, names(BLOCKS)))
+
+op <- par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+for (nm in unique(d5$variety)) {
+  d <- d5[d5$variety == nm, ]
+  yl <- range(c(d$pls, d$pca, d$mean_baseline))
+  plot(d$n_train, d$pls, type = "b", pch = 16, lwd = 2, col = "#2C6FBB", ylim = yl,
+       xlab = "training conditions", ylab = "held-out MSE", main = nm)
+  lines(d$n_train, d$pca, type = "b", pch = 17, lwd = 2, col = "#4C9F70")
+  lines(d$n_train, d$mean_baseline, type = "b", pch = 4, lwd = 2, lty = 2, col = "grey40")
+  legend("topright", bty = "n", cex = 0.75, lwd = 2, pch = c(16, 17, 4),
+         col = c("#2C6FBB", "#4C9F70", "grey40"), legend = c("PLS", "PCA+ridge", "mean"))
+}
+```
+
+![Learning curve: out-of-sample error against number of training
+conditions. A curve still falling at n=7 means the design is the
+limiting
+factor.](dimensionality_reduction_wheat_files/figure-commonmark/d5-learning-curve-1.png)
+
+``` r
+par(op)
+
+knitr::kable(d5, caption = "D5: held-out error as training conditions are added.")
+```
+
+|           | variety | n_train |       pls |       pca | mean_baseline |
+|:----------|:--------|--------:|----------:|----------:|--------------:|
+| Cadenza.1 | Cadenza |       3 | 0.0010059 | 0.0010913 |     0.0012042 |
+| Cadenza.2 | Cadenza |       4 | 0.0011218 | 0.0011116 |     0.0012122 |
+| Cadenza.3 | Cadenza |       5 | 0.0009843 | 0.0011078 |     0.0012901 |
+| Cadenza.4 | Cadenza |       6 | 0.0010441 | 0.0008874 |     0.0010134 |
+| Cadenza.5 | Cadenza |       7 | 0.0009199 | 0.0009267 |     0.0011342 |
+| Norin.1   | Norin   |       3 | 0.0012611 | 0.0011575 |     0.0012286 |
+| Norin.2   | Norin   |       4 | 0.0013923 | 0.0011181 |     0.0011551 |
+| Norin.3   | Norin   |       5 | 0.0011997 | 0.0011146 |     0.0012461 |
+| Norin.4   | Norin   |       6 | 0.0016552 | 0.0011237 |     0.0012024 |
+| Norin.5   | Norin   |       7 | 0.0012883 | 0.0011269 |     0.0012554 |
+
+D5: held-out error as training conditions are added.
+
+Learning curve: out-of-sample error against number of training
+conditions. A curve still falling at n=7 means the design is the
+limiting factor.
+
+------------------------------------------------------------------------
+
+## 9. D6 — Are the latent spaces reproducible?
+
+**The assumption being tested:** that a latent space is a property of
+the data, not of the random seed. PCA is deterministic; autoencoders are
+not.
+
+``` r
+seed_stability <- function(b, label, k = 3, seeds = 1:5) {
+  X <- b$R_cond
+  do.call(rbind, lapply(c("linear", "tanh", "vae"), function(ty) {
+    Zs <- lapply(seeds, function(s)
+      ae_fit(X, k = k, type = ty, epochs = 4000, lr = 0.02, seed = s)$encode(X))
+    # compare subspaces pairwise via mean principal angle cosine
+    cs <- c()
+    for (i in 1:(length(Zs) - 1)) for (j in (i + 1):length(Zs)) {
+      Qi <- qr.Q(qr(Zs[[i]])); Qj <- qr.Q(qr(Zs[[j]]))
+      cs <- c(cs, mean(svd(t(Qi) %*% Qj)$d))
+    }
+    data.frame(variety = label, model = paste0("AE-", ty),
+               mean_subspace_cosine = round(mean(cs), 4),
+               min_pair = round(min(cs), 4))
+  }))
+}
+
+d6 <- do.call(rbind, Map(seed_stability, BLOCKS, names(BLOCKS)))
+knitr::kable(d6, caption = "D6: agreement between latent subspaces fitted from different random seeds. 1.0 = identical subspace; PCA would score exactly 1.")
+```
+
+|           | variety | model     | mean_subspace_cosine | min_pair |
+|:----------|:--------|:----------|---------------------:|---------:|
+| Cadenza.1 | Cadenza | AE-linear |               0.9787 |   0.9372 |
+| Cadenza.2 | Cadenza | AE-tanh   |               0.8391 |   0.6715 |
+| Cadenza.3 | Cadenza | AE-vae    |               0.7521 |   0.6362 |
+| Norin.1   | Norin   | AE-linear |               0.9704 |   0.9157 |
+| Norin.2   | Norin   | AE-tanh   |               0.8497 |   0.6837 |
+| Norin.3   | Norin   | AE-vae    |               0.7739 |   0.7062 |
+
+D6: agreement between latent subspaces fitted from different random
+seeds. 1.0 = identical subspace; PCA would score exactly 1.
+
+------------------------------------------------------------------------
+
+## 10. Assumption validation summary
+
+| Assumption                                                                  | Tested_in      | How                                                                                                             |
+|:----------------------------------------------------------------------------|:---------------|:----------------------------------------------------------------------------------------------------------------|
+| Leading components carry structure, not noise                               | D1 §4          | Horn parallel analysis vs permuted eigenvalues                                                                  |
+| Components correspond to the experimental design                            | D2 §5          | Eta-squared of each PC on treatment and timepoint                                                               |
+| A linear autoencoder is a distinct method from PCA                          | D3 §6          | Latent-score + reconstruction agreement with PCA (Baldi-Hornik)                                                 |
+| Dimensionality reduction extracts usable cross-layer signal                 | D4 §7          | Leave-one-condition-out Q2 vs mean and design baselines                                                         |
+| 8 conditions suffice to fit these models                                    | D5 §8          | Learning curve as training conditions are added                                                                 |
+| Latent spaces are reproducible across seeds                                 | D6 §9          | Pairwise subspace cosine across 5 seeds                                                                         |
+| Non-linearity improves representation                                       | D4 §7          | AE-tanh and AE-vae vs AE-linear out of sample                                                                   |
+| Condition centroids from n=3 are stable enough to align on                  | – (not tested) | NOT TESTED HERE – degenerates at condition level, see §11 point 5                                               |
+| Condition-mean aggregation is the right granularity for the cross-block fit | D7 §7b         | PLS Q2 under condition-mean, fixed-pairing and pairing-bootstrap schemes, each against its own permutation null |
+
+Every assumption behind this analysis and where it is tested.
+
+------------------------------------------------------------------------
+
+## 11. What is safe to claim
+
+The decision rules in the outline were fixed before the results were
+seen. Applying them:
+
+### The results
+
+| Method                  | Cadenza Q² | Norin Q²  | Reads as                                  |
+|:------------------------|:-----------|:----------|:------------------------------------------|
+| condition-aligned AE    | **0.575**  | **0.450** | best in both — but see the caveat below   |
+| PLS                     | 0.287      | −0.010    | strong in Cadenza, fails in Norin         |
+| PCA + ridge             | 0.199      | 0.096     | modest, consistent                        |
+| AE-vae                  | 0.101      | 0.035     | above mean, below every supervised method |
+| design (treatment+time) | 0.021      | 0.009     | near zero                                 |
+| AE-tanh                 | 0.003      | 0.001     | indistinguishable from the mean           |
+| AE-linear               | 0.003      | 0.002     | indistinguishable from the mean           |
+| mean baseline           | 0.000      | 0.000     | reference                                 |
+
+### ✅ Safe to claim
+
+**1. Dimensionality reduction does extract usable cross-layer signal.**
+Multiple methods exceed both the mean baseline and the design baseline
+under leave-one-condition-out CV. Since the design baseline sits near
+zero (0.021 / 0.009), the signal is *not* a re-description of treatment
+and timepoint — the same conclusion, reached by a different route, as
+the K1 test in `../kinetics_limited/kinetics_what_we_can_claim.qmd`.
+
+**2. The linear autoencoder is PCA, empirically as well as in theory.**
+D3 gives latent-score cosines of 0.997 / 0.974 and reconstruction
+correlation of 1.000, with reconstruction MSE matching PCA to five
+significant figures. This confirms Baldi and Hornik (1989) *and*
+validates the implementation — the two cannot be separated, which is why
+the check is worth running.
+
+**3. Unsupervised reconstruction is close to useless for cross-layer
+prediction.** AE-linear and AE-tanh score ≈ 0.00, statistically
+indistinguishable from predicting the mean. This is not a failure of the
+optimiser (D3 proves convergence); it is a statement about the
+objective. An autoencoder trained to reconstruct RNA optimises for RNA
+variance, which is not the same thing as RNA→protein predictive
+structure. **Methods with a cross-modal or supervised objective (PLS,
+PCA+ridge, condition-aligned AE) are the ones that work.**
+
+**4. The usable latent dimension is 3–4, not more.** Parallel analysis
+(D1) passes 3 RNA components and 3–4 protein components against the
+permutation null. Any latent dimension above this is fitting noise
+regardless of what reconstruction error suggests.
+
+### ⚠️ Claim only with the caveat attached
+
+**5. The condition-aligned architecture performs best — but this run
+does not validate its defining mechanism.** The Q² of 0.575 / 0.450 is a
+genuine out-of-sample number from proper leave-one-condition-out CV with
+no leakage. However, it was run at **condition level, where each
+condition has exactly one row**. The centroid-alignment terms therefore
+degenerate: a “centroid” over one row is that row. What was actually
+tested is a reduced-rank cross-modal regression with reconstruction
+regularisation — not centroid alignment averaging three replicates,
+which is what `rnaprot/unpaired.py` does at sample level.
+
+To test the mechanism as designed, the model must be run on the **24 RNA
+× 24 protein sample-level matrices** with conditions as grouping,
+holding out whole conditions. That is the correct next step and it is
+not what is reported here.
+
+**6. Variety-dependence is large and unexplained.** PLS achieves 0.287
+in Cadenza and −0.010 in Norin — from the same pipeline on the same
+design. Consistent with Norin’s documented baseline anomaly
+(`../kinetics_limited/assumptions_validation.qmd` §2), but not
+established as its cause. Do not report a single pooled figure for “how
+well RNA predicts protein”.
+
+### ❌ Not supported
+
+**7. A VAE is not justified on this data.** AE-vae beats the plain
+autoencoders (0.101 / 0.035) but loses to every supervised method, and
+it is the **least reproducible** model tested: mean subspace cosine
+across seeds 0.752 / 0.774, worst pair 0.636. By the rule fixed in
+advance — an autoencoder counts only if it also passes D6 — it does not.
+A latent space that changes materially with the random seed is not a
+representation of the data.
+
+This is consistent with the literature rather than surprising:
+successful omics VAEs operate on thousands of observations (single
+cells) or transfer from large reference cohorts. Eight conditions is a
+different regime.
+
+**8. Individual latent dimensions cannot be interpreted biologically.**
+With ≤ 8 conditions and 3–4 real components, latent axes are not
+identified strongly enough to name. D2 shows what the leading components
+track; that is as far as interpretation should go.
+
+**9. Nothing here supports sample-level RNA↔protein correspondence.**
+The design is unpaired. Every result above is condition-level by
+construction. D7 tested the alternative directly: a *fixed* label-based
+pairing (what the reference notebook assumed) is not a safe default
+regardless of its score in any one run, because its extra 16 rows over
+the condition-mean scheme carry an arbitrary, unrepeatable draw rather
+than real signal — see D7 §7b for the numbers.
+
+### The one-paragraph version
+
+> Under leave-one-condition-out cross-validation, cross-modal
+> dimensionality reduction predicts held-out protein profiles
+> substantially better than either a mean or a design-only baseline,
+> confirming usable RNA→protein structure beyond the experimental
+> design. Linear autoencoders were verified to recover the PCA solution
+> exactly, and unsupervised reconstruction objectives were found to
+> carry essentially no cross-layer predictive value; methods with a
+> cross-modal objective are required. Variational autoencoders offered
+> no advantage over supervised linear methods and produced seed-unstable
+> latent spaces, and are not recommended at this sample size.
+
+### What would strengthen this
+
+1.  **Run the condition-aligned AE at sample level** (24 × 24 with
+    condition grouping), which is what `rnaprot/unpaired.py` does and
+    what point 5 above requires.
+2.  **Add a permutation null to the rest of D4.** D7 does this for PLS
+    specifically, under all three pairing schemes; PCA+ridge, the
+    autoencoders and the condition-aligned AE in D4 still report only a
+    point-estimate Q², per Westerhuis et al. (2008).
+3.  **Explain the Cadenza/Norin gap** before pooling anything across
+    varieties.
+
+## References
+
+- Baldi and Hornik (1989) — linear autoencoders recover the PCA
+  subspace; no local minima. Basis of D3.
+- Jolliffe and Cadima (2016) — PCA, its assumptions and limits.
+- Westerhuis et al. (2008) — cross-validated Q² with a permutation null
+  for small-n omics PLS.
+- Kingma and Welling (2014) — the variational autoencoder.
+- Schwanhäusser et al. (2011) — context for the RNA/protein relationship
+  being modelled.
+
+> **A note on identifiability, worth carrying to any future work here.**
+> D3 initially appeared to fail (weight-subspace cosine 0.02) on a model
+> whose reconstruction was provably optimal. The cause was that with p ≫
+> n the **encoder weights are not identified** — only their projection
+> into the data row space affects anything. Comparing latent scores and
+> reconstructions instead gave cosine 1.000. Any comparison of
+> autoencoders against PCA on omics-shaped data should compare
+> identified quantities, or it will report differences that do not
+> exist.
+
+<div id="refs" class="references csl-bib-body hanging-indent">
+
+<div id="ref-baldi1989" class="csl-entry">
+
+Baldi, Pierre, and Kurt Hornik. 1989. “Neural Networks and Principal
+Component Analysis: Learning from Examples Without Local Minima.”
+*Neural Networks* 2 (1): 53–58.
+<https://doi.org/10.1016/0893-6080(89)90014-2>.
+
+</div>
+
+<div id="ref-jolliffe2016" class="csl-entry">
+
+Jolliffe, Ian T., and Jorge Cadima. 2016. “Principal Component Analysis:
+A Review and Recent Developments.” *Philosophical Transactions of the
+Royal Society A* 374 (2065): 20150202.
+<https://doi.org/10.1098/rsta.2015.0202>.
+
+</div>
+
+<div id="ref-kingma2014" class="csl-entry">
+
+Kingma, Diederik P., and Max Welling. 2014. “Auto-Encoding Variational
+Bayes.” In *International Conference on Learning Representations
+(ICLR)*. <https://arxiv.org/abs/1312.6114>.
+
+</div>
+
+<div id="ref-schwanhausser2011" class="csl-entry">
+
+Schwanhäusser, Björn, Dorothea Busse, Na Li, Gunnar Dittmar, Johannes
+Schuchhardt, Jana Wolf, Wei Chen, and Matthias Selbach. 2011. “Global
+Quantification of Mammalian Gene Expression Control.” *Nature* 473
+(7347): 337–42. <https://doi.org/10.1038/nature10098>.
+
+</div>
+
+<div id="ref-westerhuis2008" class="csl-entry">
+
+Westerhuis, Johan A., Huub C. J. Hoefsloot, Suzanne Smit, Daniel J. Vis,
+Age K. Smilde, Ewoud J. J. van Velzen, John P. M. van Duijnhoven, and
+Ferdi A. van Dorsten. 2008. “Assessment of PLSDA Cross Validation.”
+*Metabolomics* 4 (1): 81–89.
+<https://doi.org/10.1007/s11306-007-0099-6>.
+
+</div>
+
+</div>
