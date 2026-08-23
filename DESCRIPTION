@@ -10,19 +10,22 @@ Description: R pipeline for integrating RNA-seq and quantitative proteomics
     fallbacks documented in env/install_r_deps.R).
 Imports:
     BiocManager,
+    cluster,
     DESeq2,
     edgeR,
+    here,
     igraph,
     impute,
     knitr,
     limma,
     matrixStats,
+    mixOmics,
+    timeOmics,
     yaml
 Suggests:
     ComplexHeatmap,
     imputeLCMD,
     missForest,
-    mixOmics,
     MOFA2,
     OmicsPLS,
     preprocessCore,

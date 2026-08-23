@@ -1,0 +1,271 @@
+% ---------------------------------------------------------------------------
+% references.bib -- methodological citations for the wheat RNA/protein
+% kinetics analysis.
+%
+% NOTE: entries were assembled from literature search and should be checked
+% against the publisher record before manuscript submission -- volume/page
+% details in particular. DOIs and URLs are given where available so each can
+% be verified quickly.
+% ---------------------------------------------------------------------------
+
+@article{schwanhausser2011,
+  title   = {Global quantification of mammalian gene expression control},
+  author  = {Schwanh{\"a}usser, Bj{\"o}rn and Busse, Dorothea and Li, Na and
+             Dittmar, Gunnar and Schuchhardt, Johannes and Wolf, Jana and
+             Chen, Wei and Selbach, Matthias},
+  journal = {Nature},
+  volume  = {473},
+  number  = {7347},
+  pages   = {337--342},
+  year    = {2011},
+  doi     = {10.1038/nature10098},
+  url     = {https://www.nature.com/articles/nature10098},
+  note    = {Source of the first-order ODE formulation (dP/dt = ks*R - kd*P)
+             adapted here, and of the variance decomposition showing most
+             protein-level control is post-transcriptional.}
+}
+
+@article{smyth2004,
+  title   = {Linear models and empirical Bayes methods for assessing
+             differential expression in microarray experiments},
+  author  = {Smyth, Gordon K.},
+  journal = {Statistical Applications in Genetics and Molecular Biology},
+  volume  = {3},
+  number  = {1},
+  year    = {2004},
+  doi     = {10.2202/1544-6115.1027},
+  note    = {The moderated variance / empirical Bayes shrinkage that makes an
+             n = 3 per cell design analysable.}
+}
+
+@article{ritchie2015,
+  title   = {limma powers differential expression analyses for RNA-sequencing
+             and microarray studies},
+  author  = {Ritchie, Matthew E. and Phipson, Belinda and Wu, Di and Hu, Yifang
+             and Law, Charity W. and Shi, Wei and Smyth, Gordon K.},
+  journal = {Nucleic Acids Research},
+  volume  = {43},
+  number  = {7},
+  pages   = {e47},
+  year    = {2015},
+  doi     = {10.1093/nar/gkv007},
+  url     = {https://academic.oup.com/nar/article/43/7/e47/2414268}
+}
+
+@article{law2014,
+  title   = {voom: precision weights unlock linear model analysis tools for
+             RNA-seq read counts},
+  author  = {Law, Charity W. and Chen, Yunshun and Shi, Wei and Smyth, Gordon K.},
+  journal = {Genome Biology},
+  volume  = {15},
+  number  = {2},
+  pages   = {R29},
+  year    = {2014},
+  doi     = {10.1186/gb-2014-15-2-r29}
+}
+
+@article{carvalho2010,
+  title   = {The horseshoe estimator for sparse signals},
+  author  = {Carvalho, Carlos M. and Polson, Nicholas G. and Scott, James G.},
+  journal = {Biometrika},
+  volume  = {97},
+  number  = {2},
+  pages   = {465--480},
+  year    = {2010},
+  doi     = {10.1093/biomet/asq017},
+  note    = {The prior actually implemented in R/07_bayesian_kinetics.R.}
+}
+
+@article{piironen2017,
+  title   = {Sparsity information and regularization in the horseshoe and
+             other shrinkage priors},
+  author  = {Piironen, Juho and Vehtari, Aki},
+  journal = {Electronic Journal of Statistics},
+  volume  = {11},
+  number  = {2},
+  year    = {2017},
+  doi     = {10.1214/17-EJS1337SI},
+  url     = {https://arxiv.org/abs/1707.01694},
+  note    = {Source of the p0-based global-scale heuristic used for p0_frac.
+             NOTE: this analysis uses that heuristic with the ORIGINAL
+             horseshoe, not the full regularized horseshoe with a slab.}
+}
+
+@article{makalic2016,
+  title   = {A simple sampler for the horseshoe estimator},
+  author  = {Makalic, Enes and Schmidt, Daniel F.},
+  journal = {IEEE Signal Processing Letters},
+  volume  = {23},
+  number  = {1},
+  pages   = {179--182},
+  year    = {2016},
+  doi     = {10.1109/LSP.2015.2503725},
+  note    = {The conjugate Gibbs updates for the horseshoe scale mixture
+             implemented in the sampler.}
+}
+
+@incollection{gelman1996,
+  title     = {Efficient Metropolis jumping rules},
+  author    = {Gelman, Andrew and Roberts, Gareth O. and Gilks, Walter R.},
+  booktitle = {Bayesian Statistics 5},
+  pages     = {599--607},
+  publisher = {Oxford University Press},
+  year      = {1996},
+  note      = {Origin of the ~0.44 optimal acceptance rate for
+               one-dimensional random-walk Metropolis, the target used by the
+               adaptive step-size tuning.}
+}
+
+@article{roberts2009,
+  title   = {Examples of adaptive MCMC},
+  author  = {Roberts, Gareth O. and Rosenthal, Jeffrey S.},
+  journal = {Journal of Computational and Graphical Statistics},
+  volume  = {18},
+  number  = {2},
+  pages   = {349--367},
+  year    = {2009},
+  doi     = {10.1198/jcgs.2009.06134},
+  note    = {Adaptive scaling schemes, and the requirement that adaptation
+             stop (or diminish) so the retained chain remains valid.}
+}
+
+@article{gelman1992,
+  title   = {Inference from iterative simulation using multiple sequences},
+  author  = {Gelman, Andrew and Rubin, Donald B.},
+  journal = {Statistical Science},
+  volume  = {7},
+  number  = {4},
+  pages   = {457--472},
+  year    = {1992},
+  doi     = {10.1214/ss/1177011136},
+  note    = {The R-hat statistic used for the convergence diagnostic.}
+}
+
+@article{leek2007,
+  title   = {Capturing heterogeneity in gene expression studies by surrogate
+             variable analysis},
+  author  = {Leek, Jeffrey T. and Storey, John D.},
+  journal = {PLoS Genetics},
+  volume  = {3},
+  number  = {9},
+  pages   = {e161},
+  year    = {2007},
+  doi     = {10.1371/journal.pgen.0030161},
+  note    = {Unmodelled shared structure across genes -- the violation of
+             conditional independence tested in the residual PCA.}
+}
+
+@article{li2017,
+  title   = {Protein degradation rate in {Arabidopsis thaliana} leaf growth
+             and development},
+  author  = {Li, Lei and Nelson, Clark J. and Trosch, Josua and Castleden, Ian
+             and Huang, Shaobai and Millar, A. Harvey},
+  journal = {The Plant Cell},
+  volume  = {29},
+  number  = {2},
+  pages   = {207--228},
+  year    = {2017},
+  doi     = {10.1105/tpc.16.00768},
+  url     = {https://academic.oup.com/plcell/article/29/2/207/6099059},
+  note    = {Plant protein half-lives spanning hours to months -- the range
+             against which this design's identifiability band is judged.}
+}
+
+@article{liu2016,
+  title   = {On the dependency of cellular protein levels on mRNA abundance},
+  author  = {Liu, Yansheng and Beyer, Andreas and Aebersold, Ruedi},
+  journal = {Cell},
+  volume  = {165},
+  number  = {3},
+  pages   = {535--550},
+  year    = {2016},
+  doi     = {10.1016/j.cell.2016.03.014},
+  note    = {Review of mRNA-protein correlation and its interpretation.}
+}
+
+@article{vogel2012,
+  title   = {Insights into the regulation of protein abundance from proteomic
+             and transcriptomic analyses},
+  author  = {Vogel, Christine and Marcotte, Edward M.},
+  journal = {Nature Reviews Genetics},
+  volume  = {13},
+  number  = {4},
+  pages   = {227--232},
+  year    = {2012},
+  doi     = {10.1038/nrg3185}
+}
+
+@article{lazar2016,
+  title   = {Accounting for the multiple natures of missing values in
+             label-free quantitative proteomics data sets to compare imputation
+             strategies},
+  author  = {Lazar, Cosmin and Gatto, Laurent and Ferro, Myriam and Bruley,
+             Christophe and Burger, Thomas},
+  journal = {Journal of Proteome Research},
+  volume  = {15},
+  number  = {4},
+  pages   = {1116--1125},
+  year    = {2016},
+  doi     = {10.1021/acs.jproteome.5b00981},
+  note    = {The MNAR/MAR distinction and the imputeLCMD methods (QRILC,
+             MinProb) underlying the mixed imputation strategy.}
+}
+
+@article{tyanova2016,
+  title   = {The Perseus computational platform for comprehensive analysis of
+             (prote)omics data},
+  author  = {Tyanova, Stefka and Temu, Tikira and Sinitcyn, Pavel and Carlson,
+             Arthur and Hein, Marco Y. and Geiger, Tamar and Mann, Matthias and
+             Cox, J{\"u}rgen},
+  journal = {Nature Methods},
+  volume  = {13},
+  number  = {9},
+  pages   = {731--740},
+  year    = {2016},
+  doi     = {10.1038/nmeth.3901},
+  note    = {Origin of the down-shifted normal imputation convention
+             (downshift 1.8 SD, width 0.3) used for MNAR values.}
+}
+
+@article{rohart2017,
+  title   = {mixOmics: An {R} package for 'omics feature selection and multiple
+             data integration},
+  author  = {Rohart, Florian and Gautier, Beno{\^i}t and Singh, Amrit and
+             L{\^e} Cao, Kim-Anh},
+  journal = {PLoS Computational Biology},
+  volume  = {13},
+  number  = {11},
+  pages   = {e1005752},
+  year    = {2017},
+  doi     = {10.1371/journal.pcbi.1005752}
+}
+
+@article{bodein2019,
+  title   = {A generic multivariate framework for the integration of microbiome
+             longitudinal studies with other data types},
+  author  = {Bodein, Antoine and Chapleur, Olivier and Droit, Arnaud and
+             L{\^e} Cao, Kim-Anh},
+  journal = {Frontiers in Genetics},
+  volume  = {10},
+  pages   = {963},
+  year    = {2019},
+  doi     = {10.3389/fgene.2019.00963},
+  note    = {timeOmics: trajectory clustering on fitted profiles, used in the
+             companion trajectory-clustering notebook.}
+}
+
+@article{westerhuis2008,
+  title   = {Assessment of {PLSDA} cross validation},
+  author  = {Westerhuis, Johan A. and Hoefsloot, Huub C. J. and Smit, Suzanne
+             and Vis, Daniel J. and Smilde, Age K. and van Velzen, Ewoud J. J.
+             and van Duijnhoven, John P. M. and van Dorsten, Ferdi A.},
+  journal = {Metabolomics},
+  volume  = {4},
+  number  = {1},
+  pages   = {81--89},
+  year    = {2008},
+  doi     = {10.1007/s11306-007-0099-6},
+  note    = {Cross-validated Q2 judged against a permutation null as the
+             correct validation for PLS models on small-n omics data -- the
+             basis of the K1 test.}
+}

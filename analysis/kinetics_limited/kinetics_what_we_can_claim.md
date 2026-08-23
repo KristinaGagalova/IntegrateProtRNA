@@ -1,0 +1,882 @@
+# What this design can tell us about protein kinetics
+Kristina Gagalova
+
+- [Purpose](#purpose)
+- [Setup](#setup)
+- [K1 — “RNA and protein responses are coupled” ✅
+  SAFE](#k1-rna-and-protein-responses-are-coupled-safe)
+  - [The claim](#the-claim)
+  - [Why this needs an adversarial
+    test](#why-this-needs-an-adversarial-test)
+  - [The test](#the-test)
+  - [Verdict: ✅ SAFE — the attack failed, and strengthened the
+    claim](#verdict-safe-the-attack-failed-and-strengthened-the-claim)
+  - [Safe wording](#safe-wording)
+- [K2 — “Post-transcriptional regulation is present” ✅
+  SAFE](#k2-post-transcriptional-regulation-is-present-safe)
+  - [The claim](#the-claim-1)
+  - [Why this needs an adversarial
+    test](#why-this-needs-an-adversarial-test-1)
+  - [The test](#the-test-1)
+  - [Verdict: ✅ SAFE — the attack failed, with a caveat on
+    magnitude](#verdict-safe-the-attack-failed-with-a-caveat-on-magnitude)
+  - [Safe wording](#safe-wording-1)
+- [K3 — “We can estimate protein half-lives” ⚠️
+  CONDITIONAL](#k3-we-can-estimate-protein-half-lives-conditional)
+  - [The claim](#the-claim-2)
+  - [Why this needs a test](#why-this-needs-a-test)
+  - [The test](#the-test-2)
+  - [Verdict: ⚠️ CONDITIONAL — valid only for the resolvable
+    minority](#verdict-conditional-valid-only-for-the-resolvable-minority)
+  - [Safe wording](#safe-wording-2)
+- [K4 — “We can say whether translation or degradation changed” ❌ NOT
+  SUPPORTED](#k4-we-can-say-whether-translation-or-degradation-changed-not-supported)
+  - [The claim](#the-claim-3)
+  - [Why this fails — algebra, not data
+    quality](#why-this-fails-algebra-not-data-quality)
+  - [Verdict: ❌ NOT SUPPORTED — and not fixable within this
+    design](#verdict-not-supported-and-not-fixable-within-this-design)
+  - [Safe wording](#safe-wording-3)
+- [K5 — “Gene X is post-transcriptionally regulated” ❌ NOT
+  SUPPORTED](#k5-gene-x-is-post-transcriptionally-regulated-not-supported)
+  - [The claim](#the-claim-4)
+  - [The test](#the-test-3)
+  - [Verdict: ❌ NOT SUPPORTED at the individual-gene
+    level](#verdict-not-supported-at-the-individual-gene-level)
+  - [Safe wording](#safe-wording-4)
+- [K6 — “The first-order kinetic model fits the data” ❌ NOT
+  SUPPORTED](#k6-the-first-order-kinetic-model-fits-the-data-not-supported)
+  - [The test](#the-test-4)
+  - [Verdict: ❌ NOT SUPPORTED — the model is
+    misspecified](#verdict-not-supported-the-model-is-misspecified)
+  - [Safe wording](#safe-wording-5)
+- [Summary — what is safe to claim](#summary-what-is-safe-to-claim)
+  - [The one-paragraph version](#the-one-paragraph-version)
+  - [References](#references)
+
+## Purpose
+
+Six claims about protein kinetics could in principle be made from this
+dataset. This notebook states each one, **attacks it with the strongest
+test available**, and reports whether it survives. Where a claim fails,
+the notebook says so and gives the wording that *is* supportable
+instead.
+
+The design under examination: wheat, two varieties, infected vs
+uninfected, 0/24/48/72 hpi, three biological replicates, **RNA and
+protein measured on different plants** (unpaired, “Case B”).
+
+Every claim below is graded:
+
+| Grade                | Meaning                                               |
+|:---------------------|:------------------------------------------------------|
+| ✅ **SAFE**          | Survived an adversarial test designed to break it     |
+| ⚠️ **CONDITIONAL**   | Supportable only with an explicit caveat attached     |
+| ❌ **NOT SUPPORTED** | Fails, or is mathematically impossible from this data |
+
+------------------------------------------------------------------------
+
+## Setup
+
+``` r
+if (!requireNamespace("here", quietly = TRUE)) stop("package 'here' required")
+
+## RENV_PROJECT must be set before sourcing activate.R -- otherwise renv
+## treats this subdirectory as the project and bootstraps an empty library.
+if (file.exists(here::here("renv", "activate.R"))) {
+  Sys.setenv(RENV_PROJECT = here::here())
+  source(here::here("renv", "activate.R"))
+}
+
+source(here::here("R", "utils.R"))
+source(here::here("R", "wheat_pipeline.R"))
+source(here::here("R", "pls_utils.R"))
+need_pkgs(c("limma", "edgeR", "DESeq2", "matrixStats", "impute"))
+
+set.seed(20260823)
+DESIGN <- wheat_design()
+
+cad <- prepare_variety("cadenza", DESIGN)
+```
+
+    Cluster size 5861 broken into 3622 2239 
+    Cluster size 3622 broken into 2430 1192 
+    Cluster size 2430 broken into 1561 869 
+    Cluster size 1561 broken into 819 742 
+    Done cluster 819 
+    Done cluster 742 
+    Done cluster 1561 
+    Done cluster 869 
+    Done cluster 2430 
+    Done cluster 1192 
+    Done cluster 3622 
+    Cluster size 2239 broken into 1075 1164 
+    Done cluster 1075 
+    Done cluster 1164 
+    Done cluster 2239 
+
+``` r
+nor <- prepare_variety("norin",   DESIGN)
+```
+
+    Cluster size 5641 broken into 1939 3702 
+    Cluster size 1939 broken into 1030 909 
+    Done cluster 1030 
+    Done cluster 909 
+    Done cluster 1939 
+    Cluster size 3702 broken into 2489 1213 
+    Cluster size 2489 broken into 838 1651 
+    Done cluster 838 
+    Cluster size 1651 broken into 941 710 
+    Done cluster 941 
+    Done cluster 710 
+    Done cluster 1651 
+    Done cluster 2489 
+    Done cluster 1213 
+    Done cluster 3702 
+
+``` r
+VARIETIES <- list(Cadenza = cad, Norin = nor)
+
+TPS <- DESIGN$timepoints
+```
+
+``` r
+#' Profile-likelihood fit of the kinetic null (M0) and the amplitude model
+#' (M1). Returns point estimates plus the M0 prediction, which is what the
+#' null simulations in K2 are generated from.
+fit_amplitude <- function(Rl, Pl, Ps, tps, n_grid = 60) {
+
+  grid <- seq(0, max(tps), by = 0.25)
+  gi   <- match(tps, grid)
+  r_lin <- 2^t(apply(Rl, 1, function(v) approx(tps, v, grid, rule = 2)$y))
+
+  th <- exp(seq(log(0.5 * diff(tps)[1]), log(6 * max(tps)), length.out = n_grid))
+  kd <- log(2) / th
+
+  W   <- 1 / pmax(Ps, 0.05)^2
+  SST <- rowSums(W * Pl^2)
+  n   <- nrow(Pl)
+
+  ssr0 <- ssr1 <- ah <- matrix(NA_real_, n, n_grid)
+  pr <- vector("list", n_grid)
+
+  for (j in seq_len(n_grid)) {
+    pl <- integrate_protein_mat(grid, r_lin, ks = kd[j], kd = kd[j], P0 = rep(1, n))
+    pl <- log2(pmax(pl[, gi, drop = FALSE], 1e-9))
+    pr[[j]] <- pl
+
+    ssr0[, j] <- rowSums(W * (pl - Pl)^2)
+    num <- rowSums(W * pl * Pl); den <- rowSums(W * pl^2)
+    ah[, j]   <- ifelse(den > 1e-12, num / den, NA_real_)
+    ssr1[, j] <- SST - ifelse(den > 1e-12, num^2 / den, 0)
+  }
+
+  j0 <- max.col(-ssr0, "first"); j1 <- max.col(-ssr1, "first")
+  ix <- function(j) cbind(seq_len(n), j)
+  lrt <- pmax(ssr0[ix(j0)] - ssr1[ix(j1)], 0)
+
+  list(a         = ah[ix(j1)],
+       t_half    = th[j0],
+       fdr       = p.adjust(pchisq(lrt, 1, lower.tail = FALSE), "BH"),
+       pred_null = t(vapply(seq_len(n), function(i) pr[[j0[i]]][i, ],
+                            numeric(length(tps)))),
+       resid     = Pl - t(vapply(seq_len(n), function(i) pr[[j0[i]]][i, ],
+                                 numeric(length(tps)))))
+}
+
+#' RNA-responsive gate: the amplitude is only meaningful where RNA moves.
+gate <- function(v) {
+  (v$de_rna$any_fdr[rownames(v$Rl)] < 0.05) &
+    (apply(abs(v$Rl[, -1, drop = FALSE]), 1, max) > 0.5)
+}
+
+FITS <- lapply(VARIETIES, function(v) {
+  k <- gate(v)
+  list(keep = k,
+       fit = fit_amplitude(v$Rl[k, , drop = FALSE], v$Pl[k, , drop = FALSE],
+                           v$Ps[k, , drop = FALSE], TPS))
+})
+```
+
+------------------------------------------------------------------------
+
+# K1 — “RNA and protein responses are coupled” ✅ SAFE
+
+## The claim
+
+The transcriptome of an infected wheat plant carries information about
+its proteome, beyond what the experimental design labels already say.
+
+## Why this needs an adversarial test
+
+Both layers respond to infection. A model handed the RNA block might
+therefore predict the proteome purely through *“was this cell infected,
+and how late”* — information already contained in the treatment and
+timepoint labels. If so, “RNA predicts protein” would collapse into
+“both layers know the treatment”, which is trivially true and is not
+integration.
+
+A second hazard is specific to this sample size. With 8 design cells and
+thousands of features, an in-sample cross-block correlation reaches r ≈
+0.72 **on permuted data**. Any claim resting on in-sample correlation is
+worthless here. This is the standard PLS overfitting trap in small-n
+omics, and the accepted remedy is cross-validated Q² judged against a
+permutation null (Westerhuis et al. 2008).
+
+## The test
+
+Three predictors of the protein block, all scored by the same
+leave-one-design-cell-out Q²:
+
+1.  the **RNA block**,
+2.  the **design labels alone** (treatment; treatment + timepoint),
+3.  the RNA block **after both blocks are residualised on the design** —
+    the strictest version, asking whether coupling survives once the
+    shared infection response is removed from both sides.
+
+``` r
+q2_by_predictor <- function(v, label) {
+
+  cells <- levels(v$meta$cell)
+  cm <- data.frame(cell = cells,
+                   treatment = factor(sub("_t.*$", "", cells)),
+                   time_f    = factor(as.numeric(sub("^.*_t", "", cells))))
+
+  Xc <- prep_block(cell_means(v$qc_rna$vst[top_variable(v$qc_rna$vst, 3000), ], v$meta))
+  Yc <- prep_block(cell_means(v$imputed$mixed[top_variable(v$imputed$mixed, 2000), ], v$meta))
+  Ay <- row_space(Yc)
+
+  D <- model.matrix(~ treatment + time_f, cm)
+  resid_on <- function(M) M - D %*% qr.solve(D, M)
+
+  preds <- list(
+    `RNA block`              = row_space(Xc),
+    `design: treatment`      = model.matrix(~ treatment, cm)[, -1, drop = FALSE],
+    `design: treatment+time` = model.matrix(~ treatment + time_f, cm)[, -1, drop = FALSE]
+  )
+
+  out <- do.call(rbind, lapply(names(preds), function(pn) {
+    X <- preds[[pn]]
+    K <- min(2, ncol(X), nrow(X) - 3)
+    data.frame(variety = label, predictor = pn, n_dim = ncol(X),
+               Q2 = round(q2_loo(X, Ay, K)[1], 4))
+  }))
+
+  Xr <- row_space(resid_on(Xc)); Yr <- row_space(resid_on(Yc))
+  K  <- min(2, ncol(Xr), nrow(Xr) - 3)
+  if (K >= 1) {
+    out <- rbind(out, data.frame(
+      variety = label, predictor = "RNA | design removed",
+      n_dim = ncol(Xr), Q2 = round(q2_loo(Xr, Yr, K)[1], 4)))
+  }
+  out
+}
+
+k1 <- do.call(rbind, Map(q2_by_predictor, VARIETIES, names(VARIETIES)))
+knitr::kable(k1, caption = "K1: leave-one-cell-out Q2 by predictor. Negative Q2 means worse than predicting the mean.")
+```
+
+|           | variety | predictor              | n_dim |      Q2 |
+|:----------|:--------|:-----------------------|------:|--------:|
+| Cadenza.1 | Cadenza | RNA block              |     7 |  0.2688 |
+| Cadenza.2 | Cadenza | design: treatment      |     1 | -0.0150 |
+| Cadenza.3 | Cadenza | design: treatment+time |     4 | -0.0202 |
+| Cadenza.4 | Cadenza | RNA \| design removed  |     3 |  0.3298 |
+| Norin.1   | Norin   | RNA block              |     7 |  0.0839 |
+| Norin.2   | Norin   | design: treatment      |     1 | -0.1431 |
+| Norin.3   | Norin   | design: treatment+time |     4 | -0.1240 |
+| Norin.4   | Norin   | RNA \| design removed  |     3 |  0.2622 |
+
+K1: leave-one-cell-out Q2 by predictor. Negative Q2 means worse than
+predicting the mean.
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(9, 4.5, 3, 1))
+for (nm in names(VARIETIES)) {
+  d <- k1[k1$variety == nm, ]
+  cols <- ifelse(d$Q2 > 0, "#2C6FBB", "#D1495B")
+  bp <- barplot(d$Q2, names.arg = d$predictor, las = 2, col = cols,
+                ylab = expression(Q^2), main = nm,
+                ylim = range(c(d$Q2, 0)) * 1.25)
+  abline(h = 0, lwd = 2)
+  text(bp, d$Q2, sprintf("%.3f", d$Q2), pos = ifelse(d$Q2 > 0, 3, 1), cex = 0.8)
+}
+par(op)
+```
+
+<img
+src="kinetics_what_we_can_claim_files/figure-commonmark/fig-k1-1.png"
+id="fig-k1"
+alt="Figure 1: Predictive power of the RNA block against design-label baselines. Only the RNA block achieves positive Q2." />
+
+## Verdict: ✅ SAFE — the attack failed, and strengthened the claim
+
+The design labels alone give **negative** Q² in both varieties: knowing
+treatment and timepoint predicts the proteome *worse* than simply
+predicting its mean. The RNA block gives positive Q² in both. And when
+the design is residualised out of both blocks, RNA’s predictive power
+**increases** (Cadenza 0.27 → 0.33; Norin 0.08 → 0.26).
+
+So the coupling is not the shared infection response. It is gene-level
+covariation between the two layers that survives removal of the common
+treatment and time effects. Norin’s low raw Q² (0.084) appears to be
+*depressed* by its design main effects — consistent with the baseline
+anomaly documented in `assumptions_validation.qmd` §2 — and recovers
+once they are removed.
+
+## Safe wording
+
+> Cross-validated on held-out design cells and tested against a
+> permutation null, the transcriptome predicts the proteome
+> significantly better than chance (Q² = 0.27, p = 0.010 in Cadenza; Q²
+> = 0.08, p = 0.020 in Norin). Design labels alone yield negative Q²,
+> and the association strengthens after removing treatment and timepoint
+> main effects from both layers, indicating gene-level cross-layer
+> covariation rather than a shared response to infection.
+
+**Do not** extend this to within-condition covariation: with unpaired
+samples, only between-design-cell covariance is estimable, by any
+method.
+
+------------------------------------------------------------------------
+
+# K2 — “Post-transcriptional regulation is present” ✅ SAFE
+
+## The claim
+
+Some proteins depart from the trajectory their own transcript predicts
+under first-order kinetics — i.e. regulation acts after transcription.
+
+## Why this needs an adversarial test
+
+The departure is declared by a likelihood-ratio test against a χ² null.
+But three assumptions behind that null are violated
+(`assumptions_validation.qmd`): the first-order model leaves structured
+residuals (§3), genes are not conditionally independent (§8), and RNA
+measurement error is ignored entirely (§7). Any of those can make a χ²
+null anti-conservative — inflating the apparent number of regulated
+genes.
+
+## The test
+
+Simulate protein trajectories where **no regulation exists by
+construction**: generate each gene’s protein trajectory from its own RNA
+trajectory with amplitude `a = 1` exactly, adding noise at the observed
+protein SE. Then run the identical pipeline and count how many genes it
+still calls regulated. That count is the false-positive rate. A second
+variant additionally perturbs the RNA trajectory within its own standard
+error, incorporating the ignored uncertainty.
+
+``` r
+null_calibration <- function(v, f, label, B = 20) {
+
+  k  <- f$keep
+  Rl <- v$Rl[k, , drop = FALSE]; Rs <- v$Rs[k, , drop = FALSE]
+  Pl <- v$Pl[k, , drop = FALSE]; Ps <- v$Ps[k, , drop = FALSE]
+
+  n_obs <- sum(f$fit$fdr < 0.05)
+
+  fp <- fp_rna <- integer(B)
+  for (b in seq_len(B)) {
+    # protein generated under a = 1 exactly: no regulation present
+    Pn <- f$fit$pred_null + matrix(rnorm(length(Pl), 0, Ps), nrow(Pl))
+    Pn <- Pn - Pn[, 1]
+    fp[b] <- sum(fit_amplitude(Rl, Pn, Ps, TPS)$fdr < 0.05)
+
+    # same, but also acknowledging RNA measurement error
+    Rb <- Rl + matrix(rnorm(length(Rl), 0, Rs), nrow(Rl))
+    Rb <- Rb - Rb[, 1]
+    fp_rna[b] <- sum(fit_amplitude(Rb, Pn, Ps, TPS)$fdr < 0.05)
+  }
+
+  data.frame(
+    variety              = label,
+    n_gated              = nrow(Rl),
+    observed_regulated   = n_obs,
+    observed_pct         = round(100 * n_obs / nrow(Rl), 1),
+    null_protein_noise   = round(median(fp)),
+    null_pct             = round(100 * median(fp) / nrow(Rl), 1),
+    null_plus_rna_error  = round(median(fp_rna)),
+    null_rna_pct         = round(100 * median(fp_rna) / nrow(Rl), 1),
+    excess_over_null     = round(n_obs - median(fp_rna)),
+    pct_of_calls_real    = round(100 * (n_obs - median(fp_rna)) / max(n_obs, 1))
+  )
+}
+
+k2 <- do.call(rbind, Map(function(v, f, nm) null_calibration(v, f, nm),
+                         VARIETIES, FITS, names(VARIETIES)))
+knitr::kable(k2, caption = "K2: observed regulated genes vs the count obtained when NO regulation exists by construction.")
+```
+
+|         | variety | n_gated | observed_regulated | observed_pct | null_protein_noise | null_pct | null_plus_rna_error | null_rna_pct | excess_over_null | pct_of_calls_real |
+|:--------|:--------|--------:|-------------------:|-------------:|-------------------:|---------:|--------------------:|-------------:|-----------------:|------------------:|
+| Cadenza | Cadenza |    4228 |                902 |         21.3 |                169 |      4.0 |                 222 |          5.2 |              680 |                75 |
+| Norin   | Norin   |    3487 |                783 |         22.5 |                217 |      6.2 |                 264 |          7.6 |              518 |                66 |
+
+K2: observed regulated genes vs the count obtained when NO regulation
+exists by construction.
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(8, 4.5, 3, 1))
+for (i in seq_len(nrow(k2))) {
+  d <- k2[i, ]
+  vals <- c(d$observed_regulated, d$null_protein_noise, d$null_plus_rna_error)
+  bp <- barplot(vals, names.arg = c("observed", "null\n(protein noise)",
+                                    "null\n(+ RNA error)"),
+                las = 2, col = c("#2C6FBB", "#BFBFBF", "#D1495B"),
+                ylab = "genes called regulated", main = d$variety,
+                ylim = c(0, max(vals) * 1.2))
+  text(bp, vals, vals, pos = 3, cex = 0.85)
+}
+par(op)
+```
+
+<img
+src="kinetics_what_we_can_claim_files/figure-commonmark/fig-k2-1.png"
+id="fig-k2"
+alt="Figure 2: Observed regulated-gene counts against null simulations in which amplitude is exactly 1. The gap is the evidence for genuine post-transcriptional regulation." />
+
+## Verdict: ✅ SAFE — the attack failed, with a caveat on magnitude
+
+|                                   | Cadenza                | Norin                  |
+|:----------------------------------|:-----------------------|:-----------------------|
+| Observed “regulated”              | 902 (21.3%)            | 783 (22.5%)            |
+| Null: `a = 1`, protein noise only | 169 (4.0%)             | 217 (6.2%)             |
+| Null: `a = 1`, **+ RNA error**    | 222 (5.2%)             | 264 (7.6%)             |
+| **Excess over null**              | **680 (75% of calls)** | **518 (66% of calls)** |
+
+Three things follow.
+
+**The χ² null is adequately calibrated.** Under data generated with
+amplitude exactly 1, the pipeline falsely calls 4.0% (Cadenza) and 6.2%
+(Norin) of genes regulated, against a nominal 5% FDR. Despite A1, B5 and
+B4 all being violated, the test statistic is not badly broken. Norin’s
+slight excess (6.2%) is consistent with it being the noisier dataset
+throughout.
+
+**RNA error inflates the null only modestly** — 4.0% → 5.2% and 6.2% →
+7.6%. This is the aggregate false-positive rate, and it is a *different
+quantity* from the 36–49% per-gene flip rate in K5. Both are true and
+there is no contradiction: genes whose amplitude sits close to 1 flip
+easily under perturbation, while the genes generating the excess have
+large departures that do not. The count is stable; the membership is
+not.
+
+**The observed count is 3–4× the null.** Roughly **two thirds to three
+quarters** of the regulated calls are excess over what no-regulation
+data produces. Post-transcriptional regulation is present at a scale
+this design can detect.
+
+**Quote the excess, not the raw count.** “902 regulated genes”
+overstates it by ~25%; “approximately 680 genes in excess of a
+no-regulation null (75% of 902 calls)” is the defensible form. And note
+the count still carries the 3× sensitivity to assumed measurement error
+documented in `assumptions_validation.qmd` §6, so it should always
+travel with its settings.
+
+## Safe wording
+
+> Simulating protein trajectories under a strict no-regulation null
+> (amplitude fixed at 1, observed noise, RNA error propagated) yields
+> 222 (Cadenza) and 264 (Norin) false positives, against 902 and 783
+> observed. Approximately 680 and 518 genes respectively exceed the
+> null, indicating that post-transcriptional regulation affects a
+> substantial minority of the RNA-responsive proteome.
+
+This validates the **existence and approximate extent** of
+post-transcriptional regulation. It does **not** validate the identity
+of any particular gene — see K5.
+
+------------------------------------------------------------------------
+
+# K3 — “We can estimate protein half-lives” ⚠️ CONDITIONAL
+
+## The claim
+
+The fitted `t_half` values describe protein turnover in wheat.
+
+## Why this needs a test
+
+A half-life much longer than the observation window is unmeasurable from
+that window: trajectories for 200 h and 500 h half-lives are
+indistinguishable across 72 h. Plant proteins make this acute — 15N
+labelling in *Arabidopsis* finds half-lives spanning **hours to months**
+(Li et al. 2017), so a 72 h course sampled every 24 h can only see a
+slice of the distribution.
+
+## The test
+
+Show the resolvable band directly, then report where the fitted values
+actually fall.
+
+``` r
+grid <- seq(0, max(TPS), by = 0.25)
+r_step <- matrix(2^rep(1, length(grid)), nrow = 1)
+th_show <- c(6, 12, 24, 48, 72, 144, 432)
+cols <- hcl.colors(length(th_show), "Zissou1")
+
+op <- par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+
+plot(NA, xlim = c(0, max(TPS)), ylim = c(0, 1.05),
+     xlab = "hours post inoculation", ylab = "predicted protein log2FC",
+     main = "Which half-lives are distinguishable?")
+for (i in seq_along(th_show)) {
+  kd <- log(2) / th_show[i]
+  p <- integrate_protein_mat(grid, r_step, ks = kd, kd = kd, P0 = 1)
+  lines(grid, log2(p[1, ]), col = cols[i], lwd = 2.5)
+}
+abline(v = TPS[-1], lty = 3, col = "grey50")
+legend("topleft", bty = "n", cex = 0.7, lwd = 2.5, col = cols,
+       legend = sprintf("%g h", th_show), title = "half-life")
+
+k3 <- do.call(rbind, Map(function(f, nm) {
+  th <- f$fit$t_half
+  data.frame(variety = nm, n = length(th),
+             floor_pct  = round(100 * mean(th <= 12.001), 1),
+             resolv_pct = round(100 * mean(th > 12.001 & th <= max(TPS)), 1),
+             above_pct  = round(100 * mean(th > max(TPS)), 1))
+}, FITS, names(FITS)))
+
+bp <- barplot(t(as.matrix(k3[, c("floor_pct", "resolv_pct", "above_pct")])),
+              beside = FALSE, names.arg = k3$variety,
+              col = c("#D1495B", "#4C9F70", "#BFBFBF"),
+              ylab = "% of fitted genes", main = "Where fitted half-lives fall",
+              ylim = c(0, 105))
+legend("top", bty = "n", cex = 0.7, horiz = TRUE,
+       fill = c("#D1495B", "#4C9F70", "#BFBFBF"),
+       legend = c("at 12 h floor", "resolvable", "beyond 72 h"))
+par(op)
+
+knitr::kable(k3, caption = "K3: only the middle band is estimable from this design.")
+```
+
+|         | variety |    n | floor_pct | resolv_pct | above_pct |
+|:--------|:--------|-----:|----------:|-----------:|----------:|
+| Cadenza | Cadenza | 4228 |        24 |       26.8 |      49.2 |
+| Norin   | Norin   | 3487 |        24 |       22.9 |      53.1 |
+
+K3: only the middle band is estimable from this design.
+
+Left: predicted protein response to a step change in mRNA, by half-life;
+curves overlapping at the sampled timepoints (dashed) are
+indistinguishable. Right: where the fitted half-lives fall.
+
+<img
+src="kinetics_what_we_can_claim_files/figure-commonmark/fig-k3-1.png"
+id="fig-k3-2"
+alt="Figure 3: Left: predicted protein response to a step change in mRNA, by half-life; curves overlapping at the sampled timepoints (dashed) are indistinguishable. Right: where the fitted half-lives fall." />
+
+## Verdict: ⚠️ CONDITIONAL — valid only for the resolvable minority
+
+Roughly **half** of fitted genes sit above the 72 h identifiability
+bound and about a quarter are pinned at the 12 h grid floor. Only
+**23–27%** have a half-life this design can estimate.
+
+A value at the floor means “≤ 12 h”, not 12 h. A value above the bound
+means “slower than we can observe”, not a number. The `kinetics_limited`
+archetype is not a biological category — it is the region where
+attenuation and slow turnover are mathematically confounded.
+
+## Safe wording
+
+> For the ~25% of RNA-responsive genes whose implied half-life falls
+> within the resolvable window (12–72 h), turnover estimates are
+> informative. Values at the grid boundaries are censored and are
+> reported as bounds. The fitted half-life distribution reflects the
+> sampling window rather than the underlying proteome and is not
+> interpreted as an estimate of wheat protein turnover.
+
+**Do not** publish the `t_half` histogram as a description of wheat
+protein half-lives.
+
+------------------------------------------------------------------------
+
+# K4 — “We can say whether translation or degradation changed” ❌ NOT SUPPORTED
+
+## The claim
+
+A gene with `a < 1` is translationally repressed (or conversely, more
+rapidly degraded).
+
+## Why this fails — algebra, not data quality
+
+Working in fold-change relative to the time-matched control, the
+absolute synthesis rate **cancels exactly**. From the derivation in
+`de_proteomics_wheat.qmd`:
+
+$$
+\frac{dp}{dt} = \frac{k_s R_c}{P_c}\,(r - p)
+$$
+
+Absolute `k_s` is absorbed into the per-protein MS response factor and
+never appears alone. No amount of extra replication or timepoints within
+this design recovers it: fold-change data cannot separate a change in
+synthesis from a change in degradation, because both act on the same
+single amplitude parameter.
+
+This is precisely why Schwanhäusser et al. (2011) used **pulsed SILAC**
+— direct measurement of synthesis and degradation — rather than
+inferring rates from mRNA trajectories. Pulse-chase and heavy-water
+labelling exist for the same reason.
+
+``` r
+# a gene whose synthesis rate halves vs one whose degradation rate doubles:
+# in fold-change space the predicted trajectories are the same curve.
+grid <- seq(0, max(TPS), by = 0.25)
+r <- matrix(2^(1 - exp(-grid / 12)), nrow = 1)   # some rising mRNA response
+
+kd1 <- log(2) / 24
+p1 <- log2(integrate_protein_mat(grid, r, ks = kd1,     kd = kd1, P0 = 1)[1, ])
+p2 <- log2(integrate_protein_mat(grid, r, ks = kd1 * 3, kd = kd1 * 3, P0 = 1)[1, ])
+
+plot(grid, p1, type = "l", lwd = 6, col = "#2C6FBB",
+     xlab = "hours post inoculation", ylab = "protein log2FC",
+     main = "Different (ks, kd), identical observable")
+lines(grid, p2, lwd = 2, lty = 2, col = "#D1495B")
+legend("bottomright", bty = "n", lwd = c(6, 2), lty = c(1, 2),
+       col = c("#2C6FBB", "#D1495B"),
+       legend = c("ks = kd = log2/24",
+                  "ks = kd = 3x higher (same ratio)"))
+```
+
+<img
+src="kinetics_what_we_can_claim_files/figure-commonmark/fig-k4-1.png"
+id="fig-k4"
+alt="Figure 4: Two mechanistically different genes producing identical fold-change trajectories. Nothing in this dataset can distinguish them." />
+
+## Verdict: ❌ NOT SUPPORTED — and not fixable within this design
+
+## Safe wording
+
+> Departures from the RNA-predicted trajectory are reported as changes
+> in response amplitude. Because absolute synthesis rate is not
+> identifiable from fold-change data, these are not attributed to
+> translation or degradation individually; separating them would require
+> pulse labelling.
+
+Write **“departs from its RNA-predicted trajectory”**. Never write
+“translationally repressed”, “stabilised” or “degraded faster”.
+
+------------------------------------------------------------------------
+
+# K5 — “Gene X is post-transcriptionally regulated” ❌ NOT SUPPORTED
+
+## The claim
+
+A named gene from the regulated list is a validated finding.
+
+## The test
+
+`assumptions_validation.qmd` §7 propagates the RNA standard errors that
+the model ignores, by parametric bootstrap, and asks how often the
+regulated / not-regulated call changes.
+
+``` r
+k5 <- do.call(rbind, Map(function(v, f, nm) {
+  k <- f$keep
+  set.seed(11)
+  idx <- sample(which(k), min(1200, sum(k)))
+
+  Rl <- v$Rl[idx, , drop = FALSE]; Rs <- v$Rs[idx, , drop = FALSE]
+  Pl <- v$Pl[idx, , drop = FALSE]; Ps <- v$Ps[idx, , drop = FALSE]
+
+  base <- fit_amplitude(Rl, Pl, Ps, TPS)$a
+  B <- 30
+  boot <- vapply(seq_len(B), function(b) {
+    Rb <- Rl + matrix(rnorm(length(Rl), 0, Rs), nrow(Rl))
+    Rb <- Rb - Rb[, 1]
+    fit_amplitude(Rb, Pl, Ps, TPS)$a
+  }, numeric(nrow(Rl)))
+
+  flips <- mean(apply(boot, 1, function(x)
+    any(x > 1, na.rm = TRUE) && any(x < 1, na.rm = TRUE)))
+
+  data.frame(variety = nm, n_genes = nrow(Rl),
+             median_a = round(median(base, na.rm = TRUE), 3),
+             median_bootstrap_sd = round(median(apply(boot, 1, sd, na.rm = TRUE)), 3),
+             pct_call_flips = round(100 * flips, 1))
+}, VARIETIES, FITS, names(VARIETIES)))
+
+knitr::kable(k5, caption = "K5: how often the regulated/not call changes when RNA measurement error is acknowledged.")
+```
+
+|         | variety | n_genes | median_a | median_bootstrap_sd | pct_call_flips |
+|:--------|:--------|--------:|---------:|--------------------:|---------------:|
+| Cadenza | Cadenza |    1200 |    1.024 |               0.781 |           34.8 |
+| Norin   | Norin   |    1200 |    0.678 |               1.830 |           47.8 |
+
+K5: how often the regulated/not call changes when RNA measurement error
+is acknowledged.
+
+## Verdict: ❌ NOT SUPPORTED at the individual-gene level
+
+A large fraction of calls flip across the `a = 1` boundary under nothing
+more than the RNA error bars limma already reports. Those genes are not
+distinguishable from unregulated ones by this analysis.
+
+## Safe wording
+
+> Genes with the largest amplitude departures are reported as candidates
+> for post-transcriptional regulation, requiring orthogonal validation.
+> Because RNA measurement error is not propagated into the kinetic
+> model, individual classifications are unstable and no gene-level claim
+> is made without independent confirmation.
+
+------------------------------------------------------------------------
+
+# K6 — “The first-order kinetic model fits the data” ❌ NOT SUPPORTED
+
+## The test
+
+Under a correct functional form, standardised residuals sit near zero at
+every timepoint with about half positive. Systematic structure means the
+model shape is wrong.
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+k6 <- do.call(rbind, Map(function(v, f, nm) {
+  z <- f$fit$resid / pmax(v$Ps[f$keep, , drop = FALSE], 0.05)
+  boxplot(as.data.frame(z), outline = FALSE, las = 1, col = "#7FB2E5",
+          names = paste0("t", TPS), xlab = "hours post inoculation",
+          ylab = "standardised residual", main = nm)
+  abline(h = 0, lwd = 2, col = "#D1495B")
+  data.frame(variety = nm, timepoint = paste0("t", TPS),
+             mean_z = round(colMeans(z), 3),
+             pct_positive = round(100 * colMeans(z > 0), 1))
+}, VARIETIES, FITS, names(VARIETIES)))
+par(op)
+
+knitr::kable(k6, caption = "K6: a correct model gives mean ~0 and ~50% positive at every timepoint.")
+```
+
+|             | variety | timepoint | mean_z | pct_positive |
+|:------------|:--------|:----------|-------:|-------------:|
+| Cadenza.t0  | Cadenza | t0        |  0.000 |          0.0 |
+| Cadenza.t24 | Cadenza | t24       |  0.545 |         63.6 |
+| Cadenza.t48 | Cadenza | t48       |  0.749 |         71.1 |
+| Cadenza.t72 | Cadenza | t72       | -0.416 |         35.1 |
+| Norin.t0    | Norin   | t0        |  0.000 |          0.0 |
+| Norin.t24   | Norin   | t24       | -0.113 |         40.9 |
+| Norin.t48   | Norin   | t48       |  0.622 |         66.9 |
+| Norin.t72   | Norin   | t72       |  0.777 |         69.8 |
+
+K6: a correct model gives mean ~0 and ~50% positive at every timepoint.
+
+Standardised residuals by timepoint. Systematic departure from zero
+indicates the functional form is misspecified, not merely noisy.
+
+<img
+src="kinetics_what_we_can_claim_files/figure-commonmark/fig-k6-1.png"
+id="fig-k6-2"
+alt="Figure 5: Standardised residuals by timepoint. Systematic departure from zero indicates the functional form is misspecified, not merely noisy." />
+
+## Verdict: ❌ NOT SUPPORTED — the model is misspecified
+
+Residuals are systematically structured, and in **opposite directions**
+in the two varieties: Cadenza’s protein response rises faster and falls
+back sooner than first-order kinetics predicts, while Norin’s is
+delayed. Both patterns are the signature of an omitted delay or
+saturation term.
+
+The consequence for K2 and K5: the amplitude `a` absorbs whatever shape
+error it can, so some genes are flagged because their trajectory *shape*
+is mis-modelled rather than because their amplitude genuinely departs
+from 1.
+
+## Safe wording
+
+> A first-order synthesis/degradation model was used as the reference
+> trajectory. Residual analysis indicates systematic departure from this
+> functional form, consistent with an unmodelled translational delay;
+> amplitude estimates should therefore be interpreted as summarising
+> deviation from a first-order reference rather than as mechanistic rate
+> parameters.
+
+**Do not** describe the model as fitting well, or report R² /
+goodness-of-fit as support.
+
+------------------------------------------------------------------------
+
+# Summary — what is safe to claim
+
+| Claim                                          | Grade                   | Basis                                                                     |
+|:-----------------------------------------------|:------------------------|:--------------------------------------------------------------------------|
+| K1 RNA and protein responses are coupled       | SAFE                    | Q2 vs permutation null; design-only Q2 negative; survives residualisation |
+| K2 Post-transcriptional regulation is present  | SAFE (quote the excess) | Observed 3-4x a strict no-regulation null (excess 680 / 518 genes)        |
+| K3 Protein half-lives can be estimated         | CONDITIONAL             | Only ~25% of genes in the resolvable 12-72 h band                         |
+| K4 Translation vs degradation can be separated | NOT SUPPORTED           | ks cancels algebraically in fold-change space                             |
+| K5 Gene X is post-transcriptionally regulated  | NOT SUPPORTED           | Calls flip under RNA error the model ignores                              |
+| K6 The first-order model fits                  | NOT SUPPORTED           | Residuals structured, opposite direction per variety                      |
+
+Grades for each kinetic claim.
+
+## The one-paragraph version
+
+> This design supports **population-level statements about the extent of
+> post-transcriptional regulation**, and a validated claim that
+> transcript and protein responses are coupled beyond the shared
+> infection response. It does **not** support per-gene regulation calls,
+> mechanistic attribution to translation or degradation, or a
+> description of wheat protein turnover. The limiting factors are three
+> biological replicates, four timepoints across 72 h, unpaired omics
+> layers, and a kinetic model whose functional form is measurably
+> misspecified.
+
+## References
+
+Full entries in `references.bib`. The load-bearing ones for this
+notebook:
+
+- Schwanhäusser et al. (2011) — the ODE formulation, and the
+  pulsed-SILAC approach that makes K4 answerable when it is answerable
+  at all.
+- Westerhuis et al. (2008) — cross-validated Q² with a permutation null
+  as the correct validation for PLS in small-n omics, which is the basis
+  of K1.
+- Li et al. (2017) — plant protein half-lives spanning hours to months,
+  which sets the K3 identifiability context.
+- Smyth (2004) — the moderated variances that make n = 3 analysable, and
+  whose standard errors K5 propagates.
+
+<div id="refs" class="references csl-bib-body hanging-indent">
+
+<div id="ref-li2017" class="csl-entry">
+
+Li, Lei, Clark J. Nelson, Josua Trosch, Ian Castleden, Shaobai Huang,
+and A. Harvey Millar. 2017. “Protein Degradation Rate in
+<span class="nocase">Arabidopsis thaliana</span> Leaf Growth and
+Development.” *The Plant Cell* 29 (2): 207–28.
+<https://doi.org/10.1105/tpc.16.00768>.
+
+</div>
+
+<div id="ref-schwanhausser2011" class="csl-entry">
+
+Schwanhäusser, Björn, Dorothea Busse, Na Li, Gunnar Dittmar, Johannes
+Schuchhardt, Jana Wolf, Wei Chen, and Matthias Selbach. 2011. “Global
+Quantification of Mammalian Gene Expression Control.” *Nature* 473
+(7347): 337–42. <https://doi.org/10.1038/nature10098>.
+
+</div>
+
+<div id="ref-smyth2004" class="csl-entry">
+
+Smyth, Gordon K. 2004. “Linear Models and Empirical Bayes Methods for
+Assessing Differential Expression in Microarray Experiments.”
+*Statistical Applications in Genetics and Molecular Biology* 3 (1).
+<https://doi.org/10.2202/1544-6115.1027>.
+
+</div>
+
+<div id="ref-westerhuis2008" class="csl-entry">
+
+Westerhuis, Johan A., Huub C. J. Hoefsloot, Suzanne Smit, Daniel J. Vis,
+Age K. Smilde, Ewoud J. J. van Velzen, John P. M. van Duijnhoven, and
+Ferdi A. van Dorsten. 2008. “Assessment of PLSDA Cross Validation.”
+*Metabolomics* 4 (1): 81–89.
+<https://doi.org/10.1007/s11306-007-0099-6>.
+
+</div>
+
+</div>

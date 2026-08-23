@@ -31,6 +31,73 @@ This notebook runs the complete pipeline end to end on the real data in `../../d
 
 Steps 2--8 are defined once as reusable functions and applied to each variety; step 9 compares the two varieties' independent results against each other.
 
+------------------------------------------------------------------------
+
+# Conclusions
+
+**Read this section before the analysis.** Every assumption behind this pipeline has been tested in the companion notebook [`assumptions_validation.qmd`](assumptions_validation.qmd); five are violated and one is unresolved. The results below are real, but they support **population-level conclusions and not individual-gene claims**, and that distinction determines what can go in a manuscript.
+
+## What this analysis establishes
+
+**1. RNA and protein responses are coupled across the infection time course, and the coupling is statistically demonstrable despite unpaired samples.**
+
+Leave-one-design-cell-out cross-validation, tested against a permutation null: given the transcriptome of a treatment × timepoint cell the model has never seen, it predicts that cell's proteome better than chance.
+
+| Variety | Q² (1 component) | permutation p |
+|:--------|:-----------------|:--------------|
+| Cadenza | **0.269**        | 0.010         |
+| Norin   | **0.084**        | 0.020         |
+
+This is the most robust result in the project. It cannot be inflated by the in-sample correlation artefact that makes naive cross-block correlation meaningless at this sample size (a PLS on 8 pseudo-samples reaches r ≈ 0.72 on *permuted* data), because Q² is computed on held-out cells.
+
+**2. Post-transcriptional regulation is present, and its magnitude is larger than measurement error alone explains.**
+
+A substantial fraction of RNA-responsive genes have protein trajectories that depart from what their own transcript trajectory predicts under first-order kinetics. This holds in both varieties, analysed independently.
+
+**3. The two varieties differ, and Cadenza is the better-behaved dataset.** Cadenza has a clean baseline (0.4% of genes differentially expressed at 0 hpi, when infection cannot yet have acted), higher predictive coupling, and no significant association between control-arm drift and regulation calls. Norin fails all three (5.8% baseline DE; Q² = 0.084; drift OR 1.31, p \< 1e-15). Where they disagree, weight Cadenza.
+
+**4. Independent analyses of the two varieties agree on orthologous genes above chance** (χ² = 88.2, p = 3.7e-15 for archetype agreement). The effect is modest (Cramér's V = 0.14) but it cannot be an artefact of the procedure --- the varieties share no samples and were processed separately.
+
+## What this analysis does *not* establish
+
+**Per-gene regulation calls are not reliable.** The model treats the RNA trajectory as known exactly (`se_rna` is accepted by `fit_hierarchical_kinetics()` and never used). Propagating limma's own RNA standard errors by parametric bootstrap flips the regulated / not-regulated call for **36% of Cadenza genes and 49% of Norin genes**. None of that uncertainty appears in the reported credible intervals. Treat any named gene as a hypothesis requiring orthogonal validation (PRM, western, qPCR).
+
+**The count of regulated genes is soft.** It moves 3× across plausible measurement-error assumptions (1457 → 902 → 488 as protein SEs are scaled 0.67× → 1× → 1.5×), \~30% across imputation scheme, and 25% from the MCMC convergence fix alone. Always quote it with its settings.
+
+**Half-lives are mostly unresolvable.** Only **23--27%** of fitted genes fall in the band this design can estimate; \~50% sit above the 72 h identifiability bound and \~24% at the 12 h grid floor. A reported `t_half` of 12 h means "≤ 12 h"; above 72 h means "slower than we can see". **The fitted `t_half` distribution is a property of the sampling window, not of the wheat proteome.**
+
+**Mechanism cannot be assigned.** The amplitude parameter `a` conflates changed translation with changed degradation --- absolute `k_s` cancels algebraically in fold-change space and is not identifiable from this data (derivation in "Where the Kinetic Null Comes From", below). Write "departs from its RNA-predicted trajectory", never "translationally repressed".
+
+**Raw DE counts are pending reconciliation.** This pipeline reports 2--6× fewer differentially expressed genes than the project's standalone limma workflow on counts that match exactly (see `assumptions_validation.qmd` §2b). Until that is resolved, no DE count from either source should be published.
+
+## Assumption status
+
+| Assumption                 | Status                | Evidence                                   |
+|:---------------------------|:----------------------|:-------------------------------------------|
+| MNAR-dominant missingness  | **Holds**             | Spearman −0.74 / −0.75                     |
+| Horseshoe prior scale      | **Holds**             | Insensitive, `p0_frac` 0.05--0.40          |
+| MCMC convergence           | **Holds**             | 0% R-hat \> 1.05, ESS ≈ 1600               |
+| Protein variance known     | Partly                | Amplitude invariant; call count varies 3×  |
+| A0 baseline equivalence    | **Asymmetric**        | Cadenza 0.4%, Norin 5.8% at 0 hpi          |
+| A3 control at steady state | **Violated**          | Median control drift ≈ 0.67 log2FC         |
+| A1 first-order kinetics    | **Violated**          | Structured residuals, opposite per variety |
+| B5 gene independence       | **Violated**          | Residual PC1 62--69% vs 25% expected       |
+| B4 RNA known exactly       | **Severely violated** | 36% / 49% of calls flip                    |
+| DE reconciliation          | **Unresolved**        | 2--6× disagreement, cause unknown          |
+
+## Recommended framing for the manuscript
+
+> Integrating unpaired transcriptome and proteome time courses at the design-cell level, we find statistically significant predictive coupling between the two layers (leave-one-cell-out Q² = 0.27, permutation p = 0.01 in Cadenza), and evidence that a substantial fraction of the proteome departs from transcript-predicted trajectories. Because the design provides three biological replicates and four timepoints over 72 h, and because RNA measurement error is not propagated into the kinetic model, these findings support population-level conclusions about the extent of post-transcriptional regulation but do not support confident per-gene classification; individual candidates require orthogonal validation.
+
+## What would most improve this
+
+1.  **Resolve the DE reconciliation** (`assumptions_validation.qmd` §2b) --- upstream of everything, and a bug hunt rather than a modelling question.
+2.  **Propagate RNA uncertainty** into the kinetic model --- converts per-gene calls from unusable to usable; the single highest-value fix.
+3.  **Investigate Norin's 0 hpi baseline** --- plausibly upstream of Norin's other anomalies.
+4.  **Orthogonally validate 5--10 targets** --- the only route to a publishable gene-level claim given the above.
+
+------------------------------------------------------------------------
+
 ### Design constants
 
 Both of these were originally unknown from `data/real/*_metadata.csv` alone (which encodes only `T0`/`T1` and `t0`..`t3`) and have since been resolved against the full RNA-seq sample sheet:
@@ -348,6 +415,8 @@ run_de <- function(mat, meta, is_rna) {
 ```
 
 ## 3. Kinetic archetype classification (profile-likelihood)
+
+> **Reference material.** §3--§4 document the model, its derivation, its constants and its assumptions in full. If you are reading for results rather than method, skip to **§5 (Cadenza)**; the conclusions are at the top of this document.
 
 ### Kinetic Modeling of Transcriptome & Proteome Trajectories
 
@@ -854,6 +923,8 @@ knitr::kable(as.data.frame(table(archetype = cad_arch$archetype)),
             caption = "Cadenza: profile-likelihood archetype calls")
 ```
 
+> **How far to trust this table.** The *distribution* across archetypes is informative; the assignment of any individual gene is not. Two reasons, both quantified in `assumptions_validation.qmd`: RNA measurement error is not propagated, and flips 36% of Cadenza calls across the `a = 1` boundary (§7 there); and the first-order model leaves systematically structured residuals (§3 there), so some genes are flagged because their trajectory *shape* is mis-modelled rather than because their amplitude departs from 1. `kinetics_limited` is not a biological class --- it is the \~50% of genes where attenuation and slow turnover are mathematically confounded.
+
 ## 6. Hierarchical Bayesian kinetics: Cadenza
 
 ```{r}
@@ -928,6 +999,8 @@ knitr::kable(data.frame(component = seq_along(cad_int$q2), Q2 = round(cad_int$q2
                         p_value = signif(cad_int$p_q2, 3)),
             caption = "Cadenza: leave-one-cell-out Q2 vs permutation null")
 ```
+
+> **This is the most trustworthy number in the analysis.** Q² is computed on design cells held out of the fit, so it cannot be inflated by the in-sample artefact that makes raw cross-block correlation meaningless here (a PLS on 8 pseudo-samples reaches r ≈ 0.72 on *permuted* data). A significant Q² means the transcriptome of an unseen treatment × timepoint cell genuinely predicts that cell's proteome. Note this is a statement about **between-cell** coupling; within-cell covariance is not estimable in a Case B design by any method.
 
 ## 8. Run the pipeline: Norin
 
@@ -1447,17 +1520,32 @@ summ <- data.frame(
 knitr::kable(summ, caption = "Pipeline summary, both varieties")
 ```
 
-**Read before using any downstream number:**
+> **Every number in this table carries the caveats set out in the Conclusions at the top of this document.** In particular `lrt_regulated` and `bayes_regulated` are counts whose magnitude depends on assumptions that are violated --- they are not stable quantities. The `integration_q2` columns are.
 
--   **Half-lives below 12 h are not resolvable.** With 24 h sampling the search grid starts at `0.5 * 24 = 12 h`; faster-turnover proteins are reported at that floor rather than at their true half-life. This is a design limit, not a fitting failure.
--   **Timepoint units and treatment polarity are confirmed** (see "Design constants"): `t0..t3` = 0/24/48/72 h, `T0` = NEG control, `T1` = PN143 infected. Half-lives below are in hours.
--   **Protein QC has no decoy/contaminant/unique-peptide filter** here (§2): the provided `*_protein_gene_mapping.csv` files do not carry that MaxQuant/ DIA-NN metadata. If the original search-engine output is available, rerun QC with `../../R/01_qc_normalise.R`'s full filter instead.
--   **The hierarchical Bayesian model fixes each gene's half-life** at its own profile-likelihood joint optimum rather than sampling it jointly with amplitude (see `07_bayesian_kinetics.R`'s header for why: jointly sampling both produces a slow-mixing ridge). This sacrifices joint kinetic/amplitude uncertainty propagation -- its credible intervals should be read as "amplitude uncertainty at the point-estimate kinetics," not full posterior uncertainty.
--   **\~2% of RNA-responsive genes hit the model's numerical safety bound** (`at_bound = TRUE` in the summary tables) even after gating to RNA- responsive genes. These are real, strong-signal genes, not degenerate artefacts (verified during development) -- but their reported amplitude should be read as directional ("at least this extreme"), not a precise estimate.
--   **No ground truth exists for real data.** §9's cross-variety ortholog concordance is the best available external check, not proof of correctness -- Cadenza and Norin are permitted to genuinely differ.
+## 11. Closing --- what to carry forward
+
+The full statement of what is and is not supported is in the **Conclusions** section at the top. In brief:
+
+**Carry forward with confidence.** The Case B integration result (Q² against a permutation null on held-out design cells); the demonstration that transcript and protein responses are coupled but not identical; MNAR-dominant missingness; the finding that Cadenza is the better-behaved of the two datasets.
+
+**Carry forward as descriptive, with the denominator stated.** The archetype composition; the amplitude distribution; comparisons between large gene sets; cross-variety agreement on orthologues.
+
+**Do not carry forward.** Per-gene regulated/not-regulated calls; the count of regulated genes as a headline figure; any individual half-life; any mechanistic attribution to translation versus degradation; any raw DE count pending the reconciliation in `assumptions_validation.qmd` §2b.
+
+### Method caveats specific to this notebook
+
+-   **Protein QC has no decoy / contaminant / unique-peptide filter.** The supplied `*_protein_gene_mapping.csv` files carry no such columns. If the original MaxQuant / DIA-NN search output is available, rerun QC through `../../R/01_qc_normalise.R`'s full filter.
+-   **The hierarchical model fixes each gene's half-life** at its profile-likelihood optimum rather than sampling it jointly with amplitude (see `07_bayesian_kinetics.R`'s header: joint sampling produces a slow-mixing ridge). Its credible intervals are therefore "amplitude uncertainty at the point-estimate kinetics", not full posterior uncertainty --- and they additionally exclude RNA error entirely.
+-   **\~2% of RNA-responsive genes sit at the numerical safety bound** (`at_bound = TRUE`). Their amplitudes are directional ("at least this extreme"), not point estimates.
+-   **No ground truth exists for real data.** §9's cross-variety orthologue concordance is the best available external check, not proof of correctness --- the two varieties are permitted to genuinely differ.
 
 ### Next steps
 
--   Confirm `TREATMENT_REF` and `TIMEPOINT_VALUES` against the actual experimental record and re-render.
--   If the original MaxQuant/DIA-NN search output is available, rerun protein QC through the full `01_qc_normalise.R` filter (decoys, contaminants, unique-peptide count).
--   `docs/planning.md` §4B-4E (GNN residuals, translation-delay atlas, XGBoost/SHAP buffering predictors) remain unbuilt; evaluate against the existing `rnaprot/` codebase on `nectar` before building new versions (see project memory `proj_existing_nectar_rnaprot.md`).
+Ordered by how much they would change what can be claimed:
+
+1.  **Resolve the DE reconciliation** (`assumptions_validation.qmd` §2b) --- 2--6× disagreement with the standalone limma workflow on identical counts. Upstream of every downstream number.
+2.  **Propagate RNA uncertainty** into the kinetic model. This is what currently blocks per-gene claims.
+3.  **Investigate Norin's 0 hpi baseline** (5.8% DE before infection can act).
+4.  **Orthogonally validate 5--10 targets** (PRM / western / qPCR).
+5.  `docs/planning.md` S10 (functional enrichment) --- run it on the kinetic archetypes, which passed their validation, rather than on the trajectory clusters, which did not.
+6.  `docs/planning.md` §4B--4E remain unbuilt; evaluate against the existing `rnaprot/` codebase on `nectar` first (see project memory `proj_existing_nectar_rnaprot.md`).
