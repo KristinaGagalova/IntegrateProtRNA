@@ -1,0 +1,81 @@
+
+
+processing file: dimensionality_reduction_wheat.qmd
+1/49                            
+2/49 [setup]                    
+3/49                            
+4/49 [data-blocks]              
+5/49                            
+6/49 [fn-adam]                  
+7/49                            
+8/49 [fn-autoencoder]           
+9/49                            
+10/49 [fn-condition-ae]          
+11/49                            
+12/49 [fn-predictors]            
+13/49                            
+14/49 [d1-parallel-analysis]     
+15/49                            
+16/49 [fig-d1]                   
+17/49                            
+18/49 [d2-design-association]    
+19/49                            
+20/49 [fig-d2]                   
+21/49                            
+22/49 [d3-baldi-hornik]          
+23/49                            
+24/49 [fig-d3]                   
+25/49                            
+26/49 [d4-cv]                    
+27/49                            
+28/49 [fig-d4]                   
+29/49                            
+30/49 [d4-permutation-null]      
+31/49                            
+32/49 [d7-pairing-vs-aggregation]
+33/49                            
+34/49 [fig-d7]                   
+35/49                            
+36/49 [d8-infold-selection]      
+37/49                            
+38/49 [d9-sample-level-cond-ae]  
+39/49                            
+40/49 [d5-learning-curve]        
+41/49                            
+42/49 [d6-seed-stability]        
+43/49                            
+44/49 [d11-variety-gap]          
+45/49                            
+46/49 [d11b-effect-size]         
+47/49                            
+48/49 [assumption-summary]       
+49output file: dimensionality_reduction_wheat.knit.md
+
+/49                            
+Warning messages:
+1: In doTryCatch(return(expr), name, parentenv, handler) :
+  zero-length arrow is of indeterminate angle and so skipped
+2: In doTryCatch(return(expr), name, parentenv, handler) :
+  zero-length arrow is of indeterminate angle and so skipped
+3: In doTryCatch(return(expr), name, parentenv, handler) :
+  zero-length arrow is of indeterminate angle and so skipped
+4: In doTryCatch(return(expr), name, parentenv, handler) :
+  zero-length arrow is of indeterminate angle and so skipped
+pandoc 
+  to: >-
+    commonmark+autolink_bare_uris+emoji+footnotes+gfm_auto_identifiers+pipe_tables+strikeout+task_lists+tex_math_dollars
+  output-file: dimensionality_reduction_wheat.md
+  standalone: true
+  default-image-extension: png
+  toc: true
+  
+metadata
+  title: 'Dimensionality reduction for unpaired RNA/protein - PCA, PLS, autoencoders'
+  author: Kristina Gagalova
+  editor: visual
+  bibliography:
+    - ../kinetics_limited/references.bib
+  fig-dir: figs
+  
+Output created: dimensionality_reduction_wheat.md
+
