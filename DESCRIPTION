@@ -21,6 +21,7 @@ Imports:
     matrixStats,
     mixOmics,
     timeOmics,
+    uwot,
     yaml
 Suggests:
     ComplexHeatmap,

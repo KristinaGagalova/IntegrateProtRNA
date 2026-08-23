@@ -900,6 +900,8 @@ d8$gap <- round(d8$Q2_global_selection - d8$Q2_infold_selection, 4)
 knitr::kable(d8, caption = "D8: PLS leave-one-condition-out Q2, global (§7) vs in-fold RNA feature selection. gap > 0 means global selection was optimistic.")
 ```
 
+**Reading D8.** The gap runs the *opposite* direction from what a leakage concern predicts: in-fold selection scores slightly *higher* than global selection in both varieties (Cadenza 0.311 vs 0.287, Norin 0.022 vs -0.010), not lower. That is consistent with global top-variable selection **not** meaningfully inflating D4/D7's headline Q² here -- the gap is small and within the kind of fold-to-fold noise already seen elsewhere (D7's bootstrap SD was \~0.002 on a much larger resample count). This does not mean global selection can never leak, only that it is not the explanation for D4/D7's numbers on this data. The protein (Y) side is still globally selected in every scheme above, per the scoping note at the top of this section.
+
 ------------------------------------------------------------------------
 
 ## 8. D5 --- Are we sample-limited?

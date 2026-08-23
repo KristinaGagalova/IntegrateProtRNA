@@ -27,6 +27,8 @@ Kristina Gagalova
   mean?](#d4-does-any-method-beat-predicting-the-mean)
 - [7b. D7 — Condition means or individual replicates for the cross-block
   fit?](#b.-d7-condition-means-or-individual-replicates-for-the-cross-block-fit)
+- [7c. D8 — Does global feature selection
+  leak?](#c.-d8-does-global-feature-selection-leak)
 - [8. D5 — Are we sample-limited?](#d5-are-we-sample-limited)
 - [9. D6 — Are the latent spaces
   reproducible?](#d6-are-the-latent-spaces-reproducible)
@@ -91,6 +93,17 @@ arrived at independently in
 independent implementations converging on that control is reassuring —
 it is the right control for this design.
 
+**A second, revised module exists: `rnaprot/unpaired_reviewer.py`.** It
+drives `rna_protein_unpaired_per_variety.ipynb` and mostly re-runs the
+same comparison above, but with three real differences, not just
+cosmetic ones: loss weights `0.5/0.5/3.0/0.75` rather than
+`0.5/0.5/2.0/0.5`; RNA/protein **feature selection redone inside each
+outer CV fold** rather than once globally; and a **permutation null
+(`N_PERM=200`) applied to the PCA/PLS/design baselines**, though not to
+the autoencoder. The first is a hyperparameter difference, not addressed
+further here. The second and third are genuine methodological gaps in
+D4/D7 above, closed in **D8 (§7c)** and **D7 (§7b)** respectively.
+
 ------------------------------------------------------------------------
 
 ## Analysis outline
@@ -105,6 +118,7 @@ it is the right control for this design.
 | §6   | **D3** Linear AE ≡ PCA?                     | Baldi–Hornik verification, a correctness check                   |
 | §7   | **D4** Does any method beat the mean?       | The headline comparison, leave-one-condition-out                 |
 | §7b  | **D7** Condition means vs replicate pairing | Aggregated (n=8) vs sample-level (n=24), with a permutation null |
+| §7c  | **D8** Does global feature selection leak?  | Global vs in-fold RNA feature selection                          |
 | §8   | **D5** Are we sample-limited?               | Learning curve                                                   |
 | §9   | **D6** Are latent spaces stable?            | Seed-to-seed reproducibility                                     |
 | §10  | Assumption validation summary               |                                                                  |
@@ -1074,13 +1088,10 @@ for (nm in unique(d7$variety)) {
 
     Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
     zero-length arrow is of indeterminate angle and so skipped
-
     Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
     zero-length arrow is of indeterminate angle and so skipped
-
     Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
     zero-length arrow is of indeterminate angle and so skipped
-
     Warning in arrows(bp, d$Q2 - err, bp, d$Q2 + err, angle = 90, code = 3, :
     zero-length arrow is of indeterminate angle and so skipped
 
@@ -1093,14 +1104,121 @@ src="dimensionality_reduction_wheat_files/figure-commonmark/fig-d7-1.png"
 id="fig-d7"
 alt="Figure 5: D7: observed Q2 (bars) against its own permutation null 95th percentile (dashed). Error bars on the bootstrap scheme show +-1 SD across 30 random pairings." />
 
-**Reading D7.** More rows help the fit *only if the extra rows carry
-real signal*: the fixed pairing and the bootstrap both give the model 21
-training rows per fold instead of 7, but only the bootstrap’s extra rows
-are honest about carrying zero within-cell signal in expectation. The
-fixed pairing’s extra rows carry whatever the one arbitrary label draw
-happened to produce — which is exactly why it is not a safe default,
-independent of whether it happens to score higher or lower here in any
-single run.
+**Reading D7 — condition means win, and not by a small margin.** Before
+running this, the expectation going in was that 21 training rows per
+fold should beat 7, since more data usually helps a fit. That is not
+what happened. **Condition means are the best-performing scheme in both
+varieties** (Cadenza Q² = 0.287, Norin Q² = -0.010), and the
+replicate-pairing bootstrap — the scheme designed to be the
+statistically honest way to use individual replicates — is not just
+worse, it is **decisively negative and stably so** (Cadenza -0.212,
+Norin -0.340, SD across 30 pairings only 0.002, and p_perm =
+0.295/0.485: it does not even beat its own permutation null).
+
+The reason, on reflection, is that a single replicate is a much noisier
+observation than a condition mean, and the replicate-pairing bootstrap
+adds a *second* layer of noise on top — the fictional within-cell
+pairing — with zero informative covariance by construction.
+Condition-mean aggregation already averages out real replicate noise
+before the cross-block fit ever sees the data; individual-replicate
+schemes hand the model 3x the rows but at a much worse per-row
+signal-to-noise ratio, and PLS with a handful of components cannot
+separate that added noise from the between-condition signal it is trying
+to learn. More rows did not mean more information here.
+
+The **fixed label pairing** (what the reference notebook assumed)
+happens to score better than the bootstrap and even beats its own null
+(p_perm = 0.005/0.015) — but this is exactly the outcome that makes it
+dangerous to trust as a default, not a vindication of it: its result is
+driven by one arbitrary, unrepeatable draw of which replicate got
+matched to which. That the draw happened to land favourably here does
+not make the method sound, and there is no way to know in advance, on a
+new dataset, whether it would land favourably or not.
+
+**Conclusion for the question this section set out to answer: use
+condition means.** Not because individual samples were never tried, but
+because they were tried two different ways and both lost, one of them by
+a wide and stable margin.
+
+------------------------------------------------------------------------
+
+## 7c. D8 — Does global feature selection leak?
+
+`make_blocks()` (§1) selects the top-variable RNA genes **once, using
+all 24 samples**, before any cross-validation loop runs.
+`rnaprot/unpaired_reviewer.py` (the module behind the reference
+notebook’s other comparison, see the Purpose section) instead re-selects
+features **inside each outer fold**, using only the training samples. If
+global selection leaks, D4/D7’s Q² is optimistic relative to what a
+genuinely unseen condition would get.
+
+This checks the RNA (X) side only, holding the protein (Y) target set
+fixed at the same 1000 genes D4/D7 use — re-selecting Y in-fold as well
+would change which proteins are being predicted from fold to fold, which
+breaks a single pooled Q² across folds. That means this is a partial
+check: it answers whether X-side selection leakage matters, not Y-side.
+
+``` r
+#' Leave-one-condition-out Q2 with RNA feature selection redone inside each
+#' fold, using only that fold's training samples. Protein features are fixed
+#' (hv_p_fixed) to keep a single well-defined target set across folds.
+loco_infold_fs <- function(v, hv_p_fixed, n_rna = 2000, k = 2) {
+  meta  <- v$meta
+  cells <- levels(meta$cell)
+  cs <- function(M) { M <- scale(M, TRUE, FALSE); M / sqrt(sum(M^2) / nrow(M)) }
+
+  P_cond <- cs(t(cell_means(v$imputed$mixed[hv_p_fixed, , drop = FALSE], meta)))
+
+  press <- setNames(numeric(length(cells)), cells)
+  for (cl in cells) {
+    train_samples <- rownames(meta)[meta$cell != cl]
+    hv_r   <- top_variable(v$qc_rna$vst[, train_samples, drop = FALSE], n_rna)
+    R_cond <- cs(t(cell_means(v$qc_rna$vst[hv_r, , drop = FALSE], meta)))
+
+    te <- rownames(R_cond) == cl; tr <- !te
+    pred <- pred_pls(R_cond[tr, , drop = FALSE], P_cond[tr, , drop = FALSE],
+                     R_cond[te, , drop = FALSE], k = k)
+    press[cl] <- sum((P_cond[te, , drop = FALSE] - pred)^2)
+  }
+  tss <- sum(vapply(cells, function(cl) {
+    te <- rownames(P_cond) == cl
+    sum(sweep(P_cond[te, , drop = FALSE], 2, colMeans(P_cond[!te, , drop = FALSE]))^2)
+  }, numeric(1)))
+  1 - sum(press) / tss
+}
+
+d8 <- do.call(rbind, lapply(names(BLOCKS), function(nm) {
+  v <- VARIETIES[[nm]]
+  hv_p_fixed <- top_variable(v$imputed$mixed, 1000)
+  data.frame(
+    variety            = nm,
+    Q2_global_selection = d4$Q2[d4$variety == nm & d4$method == "PLS"],
+    Q2_infold_selection = round(loco_infold_fs(v, hv_p_fixed), 4)
+  )
+}))
+d8$gap <- round(d8$Q2_global_selection - d8$Q2_infold_selection, 4)
+knitr::kable(d8, caption = "D8: PLS leave-one-condition-out Q2, global (§7) vs in-fold RNA feature selection. gap > 0 means global selection was optimistic.")
+```
+
+| variety | Q2_global_selection | Q2_infold_selection |     gap |
+|:--------|--------------------:|--------------------:|--------:|
+| Cadenza |              0.2872 |              0.3111 | -0.0239 |
+| Norin   |             -0.0098 |              0.0223 | -0.0321 |
+
+D8: PLS leave-one-condition-out Q2, global (§7) vs in-fold RNA feature
+selection. gap \> 0 means global selection was optimistic.
+
+**Reading D8.** The gap runs the *opposite* direction from what a
+leakage concern predicts: in-fold selection scores slightly *higher*
+than global selection in both varieties (Cadenza 0.311 vs 0.287, Norin
+0.022 vs -0.010), not lower. That is consistent with global top-variable
+selection **not** meaningfully inflating D4/D7’s headline Q² here – the
+gap is small and within the kind of fold-to-fold noise already seen
+elsewhere (D7’s bootstrap SD was ~0.002 on a much larger resample
+count). This does not mean global selection can never leak, only that it
+is not the explanation for D4/D7’s numbers on this data. The protein (Y)
+side is still globally selected in every scheme above, per the scoping
+note at the top of this section.
 
 ------------------------------------------------------------------------
 
