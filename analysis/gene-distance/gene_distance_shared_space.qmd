@@ -41,7 +41,7 @@ See `dimensionality_reduction_wheat.qmd` §7c for that check. This document does
 ## Analysis outline
 
 | Step | What                                           | Why                                                       |
-|:-------------|:-------------------------|:-------------------------------|
+|:-----|:-----------------------------------------------|:----------------------------------------------------------|
 | §1   | Setup and data (real + simulated)              | Validate on known ground truth before touching real data  |
 | §2   | The method and its assumptions                 | Each with references                                      |
 | §3   | Implementation                                 | Shared-space construction, from scratch                   |
@@ -156,7 +156,7 @@ For each gene present in both layers:
 ### Assumptions, stated up front
 
 | \#  | Assumption                                                                               | Status                                                                      |
-|:------------|:-------------------------------|:--------------------------|
+|:----|:-----------------------------------------------------------------------------------------|:----------------------------------------------------------------------------|
 | A1  | The RNA\<-\>protein correspondence used is genuinely 1:1 for the genes scored            | Enforced by construction (see §4); ambiguous groups excluded                |
 | A2  | Condition means are the right granularity for a cross-block comparison                   | Carried over from D7, not re-derived here                                   |
 | A3  | Comparing row-centred *shape*, not absolute level, is the right notion of "look alike"   | Design choice, stated not tested                                            |
@@ -659,6 +659,99 @@ cat("\nFiles contain columns:\n",
 
 ------------------------------------------------------------------------
 
+## 8a. Per-condition analysis: Which condition drives discordance?
+
+The overall distance d_full summarizes discrepancy across all 8 conditions. But which conditions contribute most to each gene's distance? This breakdown reveals:
+
+-   Condition-specific RNA-protein divergence
+-   Whether discordance is spread across treatments or concentrated
+-   Which timepoint shows largest divergence
+
+```{r}
+#| label: per-condition-contributions
+
+#' Calculate per-condition contribution to overall distance
+#' Returns data frame with each condition's squared contribution
+condition_contributions <- function(R_centered, P_centered, condition_names = NULL) {
+
+  if (is.null(condition_names)) {
+    condition_names <- colnames(R_centered)
+  }
+
+  # Fit scaler on RNA only
+  mu <- colMeans(R_centered)
+  sdv <- apply(R_centered, 2, sd); sdv[sdv < 1e-8] <- 1
+
+  # Standardize
+  Rs <- sweep(sweep(R_centered, 2, mu, "-"), 2, sdv, "/")
+  Ps <- sweep(sweep(P_centered, 2, mu, "-"), 2, sdv, "/")
+
+  # Per-condition squared contribution: (s_c * x_ic - y_ic)²
+  contributions <- (Rs - Ps)^2
+
+  # Convert to data frame with condition names
+  colnames(contributions) <- condition_names
+  contributions
+}
+
+# Calculate for each variety
+per_cond_contributions <- list()
+
+for (nm in c("Cadenza", "Norin")) {
+  cat("\n**", nm, ":**\n", sep = "")
+
+  # Get the real variety data
+  v <- REAL[[nm]]
+  common <- intersect(rownames(v$qc_rna$vst), rownames(v$imputed$mixed))
+  R_cond <- cell_means(v$qc_rna$vst[common, , drop = FALSE], v$meta)
+  P_cond <- cell_means(v$imputed$mixed[common, , drop = FALSE], v$meta)
+
+  # Get centered versions (from the gene_distance_real output)
+  sp <- build_shared_space(R_cond, P_cond)
+
+  # Calculate per-condition contributions
+  contrib <- condition_contributions(sp$Rs, sp$Ps, colnames(R_cond))
+
+  # Calculate total distance per gene and contribution %
+  d_total <- sqrt(rowSums(contrib))
+  contrib_pct <- sweep(contrib, 1, d_total^2, "/") * 100
+
+  # For each gene, identify top 3 contributing conditions
+  top_contrib <- data.frame(
+    gene_id = rownames(contrib),
+    distance = d_total,
+    top_cond_1 = NA,
+    top_pct_1 = NA,
+    top_cond_2 = NA,
+    top_pct_2 = NA,
+    top_cond_3 = NA,
+    top_pct_3 = NA
+  )
+
+  for (i in seq_len(nrow(contrib_pct))) {
+    top3_idx <- order(-contrib_pct[i, ])[1:3]
+    for (j in 1:3) {
+      top_contrib[[paste0("top_cond_", j)]][i] <- colnames(contrib_pct)[top3_idx[j]]
+      top_contrib[[paste0("top_pct_", j)]][i] <- round(contrib_pct[i, top3_idx[j]], 1)
+    }
+  }
+
+  per_cond_contributions[[nm]] <- list(
+    contributions = contrib,
+    contributions_pct = contrib_pct,
+    top_contributors = top_contrib,
+    distance = d_total
+  )
+
+  # Show summary
+  cat("  Example genes with top contributing conditions:\n")
+  top_genes <- top_contrib[order(-top_contrib$distance), ][1:5, ]
+  print(top_genes[, c("gene_id", "distance", "top_cond_1", "top_pct_1")])
+}
+```
+
+------------------------------------------------------------------------
+
 ## 8b. Three-metric decomposition: Distance, Correlation, Amplitude
 
 A single distance number masks biological diversity. The same high distance can arise from different mechanisms:
@@ -692,7 +785,7 @@ for (nm in c("Cadenza", "Norin")) {
 ### Interpretation of the three metrics
 
 | d_full   | correlation  | amplitude | biological meaning                                       |
-|------------|------------|------------|-------------------------------------|
+|----------|--------------|-----------|----------------------------------------------------------|
 | low      | high         | \~0       | identical response shape and strength                    |
 | moderate | high         | ±large    | same response pattern, protein buffered or amplified     |
 | high     | high         | ±large    | similar pattern but large amplitude difference (unusual) |
@@ -1006,6 +1099,95 @@ p <- ggplot(density_data, aes(x = UMAP1, y = UMAP2, fill = modality)) +
 print(p)
 ```
 
+### V3c --- Per-condition contributions to distance
+
+Which conditions drive the most RNA-protein discordance? Heatmap shows each gene (rows) and condition contribution (columns).
+
+```{r}
+#| label: v3c-condition-heatmap
+#| fig-cap: "V3c: Per-condition contribution to RNA-protein distance (% of total d_full²). Red = high contribution. Shows which timepoints/treatments are most discordant."
+#| fig-width: 12
+#| fig-height: 6
+
+for (nm in c("Cadenza", "Norin")) {
+  if (!is.null(per_cond_contributions[[nm]])) {
+    contrib_pct <- per_cond_contributions[[nm]]$contributions_pct
+    distance <- per_cond_contributions[[nm]]$distance
+
+    # Sort by distance (most discordant first)
+    idx_sort <- order(-distance)
+    contrib_sorted <- contrib_pct[idx_sort[1:min(50, nrow(contrib_pct))], ]
+
+    # Heatmap using base R
+    par(mar = c(5, 12, 2, 1))
+    image(t(contrib_sorted), col = colorRampPalette(c("white", "orange", "red"))(100),
+          xaxt = "n", yaxt = "n",
+          main = paste(nm, ": Per-condition contribution to distance\n(top 50 most-discordant genes)"))
+    axis(1, at = seq(0, 1, length.out = ncol(contrib_sorted)), labels = colnames(contrib_sorted), las = 2)
+    axis(2, at = seq(0, 1, length.out = min(50, nrow(contrib_pct))), labels = rownames(contrib_sorted), las = 1, cex.axis = 0.6)
+  }
+}
+```
+
+### V3d --- Per-condition trends: average discordance by timepoint/treatment
+
+Which conditions show the most RNA-protein discrepancy across all genes? Shows mean and distribution of discordance for each condition.
+
+```{r}
+#| label: v3d-condition-trends
+#| fig-cap: "V3d: Per-condition discordance trends. Left: mean contribution per condition. Right: distribution of per-condition squared differences across all genes. Which conditions are systematically discordant?"
+#| fig-width: 14
+#| fig-height: 5
+
+op <- par(mfrow = c(1, 2), mar = c(5, 4, 3, 1))
+
+for (nm in c("Cadenza", "Norin")) {
+  if (!is.null(per_cond_contributions[[nm]])) {
+    contrib <- per_cond_contributions[[nm]]$contributions
+    contrib_pct <- per_cond_contributions[[nm]]$contributions_pct
+
+    # Left: Mean contribution per condition
+    mean_contrib <- colMeans(contrib)
+    mean_contrib_pct <- colMeans(contrib_pct)
+
+    barplot(mean_contrib_pct, names.arg = colnames(contrib), las = 2,
+            ylab = "Mean % contribution to distance",
+            main = paste(nm, ": Average per-condition discordance"),
+            col = "#2E86AB", border = NA)
+
+    # Right: Box plot of per-condition discrepancies
+    contrib_long <- data.frame(
+      condition = rep(colnames(contrib), each = nrow(contrib)),
+      distance_sq = as.vector(as.matrix(contrib))
+    )
+
+    boxplot(distance_sq ~ condition, data = contrib_long, las = 2,
+            ylab = "Per-condition squared difference",
+            main = paste(nm, ": Distribution of discordance by condition"),
+            col = "#A23B72", border = NA)
+  }
+}
+
+par(op)
+
+# Summary statistics
+cat("\n**Summary: Per-condition discordance**\n\n")
+for (nm in c("Cadenza", "Norin")) {
+  if (!is.null(per_cond_contributions[[nm]])) {
+    contrib_pct <- per_cond_contributions[[nm]]$contributions_pct
+    mean_pct <- colMeans(contrib_pct)
+    sd_pct <- apply(contrib_pct, 2, sd)
+
+    cat("**", nm, ":**\n", sep = "")
+    for (i in seq_along(mean_pct)) {
+      cat(sprintf("  %s: %.1f%% ± %.1f%% mean contribution\n",
+                  names(mean_pct)[i], mean_pct[i], sd_pct[i]))
+    }
+    cat("\n")
+  }
+}
+```
+
 ### V4 --- Comparing full space, PCA, and UMAP distances
 
 Are the rankings stable across different projection methods? If so, the distance metric is robust.
@@ -1066,7 +1248,7 @@ where $s_c$ is the across-gene RNA SD for condition $c$, $x_{ic}$ is the centred
 From G2 and V4:
 
 | Space                 | Use for ranking?        | AUC (discordant vs baseline) | Notes                                                                                          |
-|-------------|-------------|-------------|---------------------------------|
+|-----------------------|-------------------------|------------------------------|------------------------------------------------------------------------------------------------|
 | **Full standardised** | ✅ Yes (A4 validated)   | 0.820                        | Most informative, distance preserved exactly                                                   |
 | **Top-2 PCA**         | ✅ Yes (nearly as good) | 0.827                        | Minimal loss of ranking power; visualisable as 2D plot                                         |
 | **2D UMAP**           | ⚠️ Use with caution     | 0.799                        | Designed for local structure, not global distances; loses \~2% AUC but more intuitive visually |

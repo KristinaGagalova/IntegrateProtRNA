@@ -17,6 +17,8 @@ Kristina Gagalova
   data](#g3-permutation-null-on-real-data)
 - [7. G4 — Replicate-level stability](#g4-replicate-level-stability)
 - [8. Apply to real data](#apply-to-real-data)
+- [8a. Per-condition analysis: Which condition drives
+  discordance?](#a.-per-condition-analysis-which-condition-drives-discordance)
 - [8b. Three-metric decomposition: Distance, Correlation,
   Amplitude](#b.-three-metric-decomposition-distance-correlation-amplitude)
   - [Interpretation of the three
@@ -32,6 +34,10 @@ Kristina Gagalova
   - [V3 — Distance distributions](#v3-distance-distributions)
   - [V3b — Density distribution in UMAP
     space](#v3b-density-distribution-in-umap-space)
+  - [V3c — Per-condition contributions to
+    distance](#v3c-per-condition-contributions-to-distance)
+  - [V3d — Per-condition trends: average discordance by
+    timepoint/treatment](#v3d-per-condition-trends-average-discordance-by-timepointtreatment)
   - [V4 — Comparing full space, PCA, and UMAP
     distances](#v4-comparing-full-space-pca-and-umap-distances)
 - [Interpretation: Is the distance
@@ -982,6 +988,124 @@ cat("\nFiles contain columns:\n",
 
 ------------------------------------------------------------------------
 
+## 8a. Per-condition analysis: Which condition drives discordance?
+
+The overall distance d_full summarizes discrepancy across all 8
+conditions. But which conditions contribute most to each gene’s
+distance? This breakdown reveals:
+
+- Condition-specific RNA-protein divergence
+- Whether discordance is spread across treatments or concentrated
+- Which timepoint shows largest divergence
+
+``` r
+#' Calculate per-condition contribution to overall distance
+#' Returns data frame with each condition's squared contribution
+condition_contributions <- function(R_centered, P_centered, condition_names = NULL) {
+
+  if (is.null(condition_names)) {
+    condition_names <- colnames(R_centered)
+  }
+
+  # Fit scaler on RNA only
+  mu <- colMeans(R_centered)
+  sdv <- apply(R_centered, 2, sd); sdv[sdv < 1e-8] <- 1
+
+  # Standardize
+  Rs <- sweep(sweep(R_centered, 2, mu, "-"), 2, sdv, "/")
+  Ps <- sweep(sweep(P_centered, 2, mu, "-"), 2, sdv, "/")
+
+  # Per-condition squared contribution: (s_c * x_ic - y_ic)²
+  contributions <- (Rs - Ps)^2
+
+  # Convert to data frame with condition names
+  colnames(contributions) <- condition_names
+  contributions
+}
+
+# Calculate for each variety
+per_cond_contributions <- list()
+
+for (nm in c("Cadenza", "Norin")) {
+  cat("\n**", nm, ":**\n", sep = "")
+
+  # Get the real variety data
+  v <- REAL[[nm]]
+  common <- intersect(rownames(v$qc_rna$vst), rownames(v$imputed$mixed))
+  R_cond <- cell_means(v$qc_rna$vst[common, , drop = FALSE], v$meta)
+  P_cond <- cell_means(v$imputed$mixed[common, , drop = FALSE], v$meta)
+
+  # Get centered versions (from the gene_distance_real output)
+  sp <- build_shared_space(R_cond, P_cond)
+
+  # Calculate per-condition contributions
+  contrib <- condition_contributions(sp$Rs, sp$Ps, colnames(R_cond))
+
+  # Calculate total distance per gene and contribution %
+  d_total <- sqrt(rowSums(contrib))
+  contrib_pct <- sweep(contrib, 1, d_total^2, "/") * 100
+
+  # For each gene, identify top 3 contributing conditions
+  top_contrib <- data.frame(
+    gene_id = rownames(contrib),
+    distance = d_total,
+    top_cond_1 = NA,
+    top_pct_1 = NA,
+    top_cond_2 = NA,
+    top_pct_2 = NA,
+    top_cond_3 = NA,
+    top_pct_3 = NA
+  )
+
+  for (i in seq_len(nrow(contrib_pct))) {
+    top3_idx <- order(-contrib_pct[i, ])[1:3]
+    for (j in 1:3) {
+      top_contrib[[paste0("top_cond_", j)]][i] <- colnames(contrib_pct)[top3_idx[j]]
+      top_contrib[[paste0("top_pct_", j)]][i] <- round(contrib_pct[i, top3_idx[j]], 1)
+    }
+  }
+
+  per_cond_contributions[[nm]] <- list(
+    contributions = contrib,
+    contributions_pct = contrib_pct,
+    top_contributors = top_contrib,
+    distance = d_total
+  )
+
+  # Show summary
+  cat("  Example genes with top contributing conditions:\n")
+  top_genes <- top_contrib[order(-top_contrib$distance), ][1:5, ]
+  print(top_genes[, c("gene_id", "distance", "top_cond_1", "top_pct_1")])
+}
+```
+
+
+    **Cadenza:**
+      Example genes with top contributing conditions:
+                                                                  gene_id distance
+    TraesCAD_scaffold_014747_01G000100 TraesCAD_scaffold_014747_01G000100 14.58265
+    TraesCAD_scaffold_133124_01G000100 TraesCAD_scaffold_133124_01G000100 13.46543
+    TraesCAD_scaffold_116541_01G000100 TraesCAD_scaffold_116541_01G000100 13.42158
+    TraesCAD_scaffold_146252_01G000100 TraesCAD_scaffold_146252_01G000100 12.98171
+    TraesCAD_scaffold_129059_01G000100 TraesCAD_scaffold_129059_01G000100 12.07514
+                                       top_cond_1 top_pct_1
+    TraesCAD_scaffold_014747_01G000100     T1_t24      18.2
+    TraesCAD_scaffold_133124_01G000100     T1_t24      45.4
+    TraesCAD_scaffold_116541_01G000100      T1_t0      55.0
+    TraesCAD_scaffold_146252_01G000100     T0_t48      48.6
+    TraesCAD_scaffold_129059_01G000100     T0_t24      42.6
+
+    **Norin:**
+      Example genes with top contributing conditions:
+                                        gene_id distance top_cond_1 top_pct_1
+    TraesNOR1D03G00570400 TraesNOR1D03G00570400 15.02558      T1_t0      28.6
+    TraesNOR6A03G03297390 TraesNOR6A03G03297390 14.10718     T1_t48      77.3
+    TraesNOR2B03G00927270 TraesNOR2B03G00927270 14.05256     T1_t48      56.2
+    TraesNOR2D03G01226140 TraesNOR2D03G01226140 13.03249     T0_t24      28.1
+    TraesNOR1A03G00156570 TraesNOR1A03G00156570 12.85264     T0_t24      57.7
+
+------------------------------------------------------------------------
+
 ## 8b. Three-metric decomposition: Distance, Correlation, Amplitude
 
 A single distance number masks biological diversity. The same high
@@ -1493,6 +1617,135 @@ print(p)
 ![V3b: 2D density distributions of RNA (blue) and protein (orange) in
 shared UMAP space. Filled contours show concentration
 levels.](gene_distance_shared_space_files/figure-commonmark/v3b-density-plots-1.png)
+
+### V3c — Per-condition contributions to distance
+
+Which conditions drive the most RNA-protein discordance? Heatmap shows
+each gene (rows) and condition contribution (columns).
+
+``` r
+for (nm in c("Cadenza", "Norin")) {
+  if (!is.null(per_cond_contributions[[nm]])) {
+    contrib_pct <- per_cond_contributions[[nm]]$contributions_pct
+    distance <- per_cond_contributions[[nm]]$distance
+
+    # Sort by distance (most discordant first)
+    idx_sort <- order(-distance)
+    contrib_sorted <- contrib_pct[idx_sort[1:min(50, nrow(contrib_pct))], ]
+
+    # Heatmap using base R
+    par(mar = c(5, 12, 2, 1))
+    image(t(contrib_sorted), col = colorRampPalette(c("white", "orange", "red"))(100),
+          xaxt = "n", yaxt = "n",
+          main = paste(nm, ": Per-condition contribution to distance\n(top 50 most-discordant genes)"))
+    axis(1, at = seq(0, 1, length.out = ncol(contrib_sorted)), labels = colnames(contrib_sorted), las = 2)
+    axis(2, at = seq(0, 1, length.out = min(50, nrow(contrib_pct))), labels = rownames(contrib_sorted), las = 1, cex.axis = 0.6)
+  }
+}
+```
+
+![V3c: Per-condition contribution to RNA-protein distance (% of total
+d_full²). Red = high contribution. Shows which timepoints/treatments are
+most
+discordant.](gene_distance_shared_space_files/figure-commonmark/v3c-condition-heatmap-1.png)
+
+![V3c: Per-condition contribution to RNA-protein distance (% of total
+d_full²). Red = high contribution. Shows which timepoints/treatments are
+most
+discordant.](gene_distance_shared_space_files/figure-commonmark/v3c-condition-heatmap-2.png)
+
+### V3d — Per-condition trends: average discordance by timepoint/treatment
+
+Which conditions show the most RNA-protein discrepancy across all genes?
+Shows mean and distribution of discordance for each condition.
+
+``` r
+op <- par(mfrow = c(1, 2), mar = c(5, 4, 3, 1))
+
+for (nm in c("Cadenza", "Norin")) {
+  if (!is.null(per_cond_contributions[[nm]])) {
+    contrib <- per_cond_contributions[[nm]]$contributions
+    contrib_pct <- per_cond_contributions[[nm]]$contributions_pct
+
+    # Left: Mean contribution per condition
+    mean_contrib <- colMeans(contrib)
+    mean_contrib_pct <- colMeans(contrib_pct)
+
+    barplot(mean_contrib_pct, names.arg = colnames(contrib), las = 2,
+            ylab = "Mean % contribution to distance",
+            main = paste(nm, ": Average per-condition discordance"),
+            col = "#2E86AB", border = NA)
+
+    # Right: Box plot of per-condition discrepancies
+    contrib_long <- data.frame(
+      condition = rep(colnames(contrib), each = nrow(contrib)),
+      distance_sq = as.vector(as.matrix(contrib))
+    )
+
+    boxplot(distance_sq ~ condition, data = contrib_long, las = 2,
+            ylab = "Per-condition squared difference",
+            main = paste(nm, ": Distribution of discordance by condition"),
+            col = "#A23B72", border = NA)
+  }
+}
+```
+
+![V3d: Per-condition discordance trends. Left: mean contribution per
+condition. Right: distribution of per-condition squared differences
+across all genes. Which conditions are systematically
+discordant?](gene_distance_shared_space_files/figure-commonmark/v3d-condition-trends-1.png)
+
+![V3d: Per-condition discordance trends. Left: mean contribution per
+condition. Right: distribution of per-condition squared differences
+across all genes. Which conditions are systematically
+discordant?](gene_distance_shared_space_files/figure-commonmark/v3d-condition-trends-2.png)
+
+``` r
+par(op)
+
+# Summary statistics
+cat("\n**Summary: Per-condition discordance**\n\n")
+```
+
+
+    **Summary: Per-condition discordance**
+
+``` r
+for (nm in c("Cadenza", "Norin")) {
+  if (!is.null(per_cond_contributions[[nm]])) {
+    contrib_pct <- per_cond_contributions[[nm]]$contributions_pct
+    mean_pct <- colMeans(contrib_pct)
+    sd_pct <- apply(contrib_pct, 2, sd)
+
+    cat("**", nm, ":**\n", sep = "")
+    for (i in seq_along(mean_pct)) {
+      cat(sprintf("  %s: %.1f%% ± %.1f%% mean contribution\n",
+                  names(mean_pct)[i], mean_pct[i], sd_pct[i]))
+    }
+    cat("\n")
+  }
+}
+```
+
+    **Cadenza:**
+      T0_t0: 17.7% ± 18.8% mean contribution
+      T0_t24: 14.6% ± 16.4% mean contribution
+      T0_t48: 10.2% ± 12.1% mean contribution
+      T0_t72: 11.6% ± 12.9% mean contribution
+      T1_t0: 14.1% ± 16.0% mean contribution
+      T1_t24: 13.5% ± 14.4% mean contribution
+      T1_t48: 8.4% ± 9.5% mean contribution
+      T1_t72: 9.7% ± 12.7% mean contribution
+
+    **Norin:**
+      T0_t0: 11.4% ± 12.9% mean contribution
+      T0_t24: 15.3% ± 16.6% mean contribution
+      T0_t48: 15.5% ± 16.0% mean contribution
+      T0_t72: 10.0% ± 10.8% mean contribution
+      T1_t0: 13.8% ± 15.5% mean contribution
+      T1_t24: 13.7% ± 13.9% mean contribution
+      T1_t48: 13.0% ± 14.7% mean contribution
+      T1_t72: 7.3% ± 9.3% mean contribution
 
 ### V4 — Comparing full space, PCA, and UMAP distances
 
