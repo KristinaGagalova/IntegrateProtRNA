@@ -72,7 +72,10 @@ if (file.exists(here::here("renv", "activate.R"))) {
 
 source(here::here("R", "utils.R"))
 source(here::here("R", "wheat_pipeline.R"))
-need_pkgs(c("limma", "edgeR", "DESeq2", "matrixStats", "impute", "uwot", "yaml"))
+need_pkgs(c("limma", "edgeR", "DESeq2", "matrixStats", "impute", "uwot", "yaml", "MASS", "ggplot2"))
+
+library(ggplot2)
+library(MASS)
 
 set.seed(20260823)
 ```
@@ -340,7 +343,15 @@ gene_distance_real <- function(v, n_perm = 199, seed = 1) {
   sp     <- build_shared_space(R_cond, P_cond)
   d_full <- euclid(sp$Rs, sp$Ps)
   d_pca2 <- euclid(sp$Zr, sp$Zp, k = 2)
-  d_umap <- umap_distance(sp$Rs, sp$Ps, seed = seed)
+
+  # UMAP fit on RNA, transform protein (asymmetric, never joint)
+  nn <- max(2, min(15, nrow(sp$Rs) %/% 4))
+  set.seed(seed)
+  umap_fit <- uwot::umap(sp$Rs, n_neighbors = nn, min_dist = 0.10, n_components = 2,
+                         metric = "euclidean", ret_model = TRUE)
+  Er <- umap_fit$embedding
+  Ep <- uwot::umap_transform(sp$Ps, umap_fit)
+  d_umap <- sqrt(rowSums((Er - Ep)^2))
 
   set.seed(seed)
   null <- replicate(n_perm, mean(euclid(sp$Rs, sp$Ps[sample(nrow(sp$Ps)), , drop = FALSE])))
@@ -349,6 +360,7 @@ gene_distance_real <- function(v, n_perm = 199, seed = 1) {
 
   list(genes = data.frame(gene_id = common, d_full = d_full,
                           d_pca2 = d_pca2, d_umap = d_umap),
+       space = list(Er = Er, Ep = Ep),
        obs = obs, null = null, p_perm = p_perm, n_genes = length(common))
 }
 
@@ -454,7 +466,306 @@ knitr::kable(TB_nor$most_concordant, row.names = FALSE,
 
 ------------------------------------------------------------------------
 
-## 9. Assumption validation summary
+## 9. Visualizations: UMAP in shared space
+
+### V1 --- Shared UMAP embeddings, real data
+
+Fit UMAP on RNA condition-means, project protein into the same space. This visualization shows where each gene's RNA and protein profiles land in a 2D manifold learned from population-level response shapes.
+
+```{r}
+#| label: fn-umap-plots
+
+#' Create UMAP plots for shared-space visualization
+plot_shared_umap <- function(space_list, dist_df, variety_name, tag = "") {
+
+  # Extract embeddings
+  Er <- space_list$Er
+  Ep <- space_list$Ep
+  distances <- dist_df$d_umap
+
+  # Create plot
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+  # Left: colored by distance
+  color_scale <- colorRampPalette(c("#2C6FBB", "#E8A33D", "#D1495B"))(100)
+  color_idx <- pmin(99, pmax(1, round((distances - min(distances)) /
+                                       (max(distances) - min(distances)) * 99) + 1))
+
+  plot(Er[, 1], Er[, 2], type = "n", xlab = "UMAP1", ylab = "UMAP2",
+       main = paste(variety_name, ": RNA-Protein Shared UMAP\n(colored by distance)"),
+       cex.main = 1.1)
+
+  # Background points
+  points(Er[, 1], Er[, 2], col = color_scale[color_idx], pch = 19,
+         cex = 2, alpha = 0.6)
+  points(Ep[, 1], Ep[, 2], col = color_scale[color_idx], pch = 17,
+         cex = 2, alpha = 0.6)
+
+  # Connecting lines
+  for (i in seq_len(nrow(Er))) {
+    lines(c(Er[i, 1], Ep[i, 1]), c(Er[i, 2], Ep[i, 2]),
+          col = rgb(0, 0, 0, 0.1), lwd = 0.5)
+  }
+
+  # Right: RNA vs Protein
+  plot(Er[, 1], Er[, 2], pch = 19, col = "#2E86AB", cex = 2, alpha = 0.7,
+       xlab = "UMAP1", ylab = "UMAP2",
+       main = paste(variety_name, ": RNA vs Protein Positions"))
+  points(Ep[, 1], Ep[, 2], pch = 17, col = "#A23B72", cex = 2, alpha = 0.7)
+
+  legend("topright", legend = c("RNA", "Protein"), pch = c(19, 17),
+         col = c("#2E86AB", "#A23B72"), cex = 0.9)
+
+  par(mfrow = c(1, 1))
+}
+
+#' Highlight top and bottom genes by distance
+plot_top_genes_umap <- function(space_list, dist_df, variety_name, n_top = 10) {
+
+  Er <- space_list$Er
+  Ep <- space_list$Ep
+  distances <- dist_df$d_umap
+
+  par(mar = c(4, 4, 3, 1))
+
+  # Background points in light gray
+  plot(Er[, 1], Er[, 2], type = "n", xlab = "UMAP1", ylab = "UMAP2",
+       main = paste(variety_name, ": Top", n_top, "Most/Least Discordant Genes"),
+       cex.main = 1.1)
+
+  points(Er[, 1], Er[, 2], col = rgb(0.5, 0.5, 0.5, 0.2), pch = 19, cex = 1.5)
+  points(Ep[, 1], Ep[, 2], col = rgb(0.5, 0.5, 0.5, 0.2), pch = 17, cex = 1.5)
+
+  # Top N most discordant (high distance)
+  top_idx <- order(-distances)[seq_len(n_top)]
+  points(Er[top_idx, 1], Er[top_idx, 2], col = "#D1495B", pch = 19, cex = 3.5)
+  points(Ep[top_idx, 1], Ep[top_idx, 2], col = "#D1495B", pch = 17, cex = 3.5)
+
+  for (i in top_idx) {
+    lines(c(Er[i, 1], Ep[i, 1]), c(Er[i, 2], Ep[i, 2]),
+          col = "#D1495B", lwd = 1.5, alpha = 0.5)
+  }
+
+  # Bottom N most concordant (low distance)
+  bottom_idx <- order(distances)[seq_len(n_top)]
+  points(Er[bottom_idx, 1], Er[bottom_idx, 2], col = "#2C6FBB", pch = 19, cex = 3.5)
+  points(Ep[bottom_idx, 1], Ep[bottom_idx, 2], col = "#2C6FBB", pch = 17, cex = 3.5)
+
+  for (i in bottom_idx) {
+    lines(c(Er[i, 1], Ep[i, 1]), c(Er[i, 2], Ep[i, 2]),
+          col = "#2C6FBB", lwd = 1.5, alpha = 0.5)
+  }
+
+  legend("topright", legend = c("Discordant (RNA)", "Discordant (Prot)",
+                                "Concordant (RNA)", "Concordant (Prot)"),
+         pch = c(19, 17, 19, 17), col = c("#D1495B", "#D1495B", "#2C6FBB", "#2C6FBB"),
+         cex = 0.9)
+}
+```
+
+```{r}
+#| label: v1-cadenza-umap
+#| fig-cap: "V1a: Cadenza shared UMAP embeddings. Left: all genes colored by RNA-protein distance. Right: RNA (circles) and protein (triangles) in the same learned manifold."
+#| fig-width: 14
+#| fig-height: 5
+
+plot_shared_umap(GD$Cadenza$space, GD$Cadenza$genes, "Cadenza")
+```
+
+```{r}
+#| label: v1-norin-umap
+#| fig-cap: "V1b: Norin shared UMAP embeddings, same layout as Cadenza."
+#| fig-width: 14
+#| fig-height: 5
+
+plot_shared_umap(GD$Norin$space, GD$Norin$genes, "Norin")
+```
+
+### V2 --- Top and bottom genes in UMAP space
+
+Which genes are most concordant (close together) and most discordant (far apart) in the shared UMAP manifold?
+
+```{r}
+#| label: v2-cadenza-topgenes
+#| fig-cap: "V2a: Cadenza. Circles = RNA, triangles = protein. Red = top 10 most discordant (high distance). Blue = bottom 10 most concordant (low distance)."
+#| fig-width: 8
+#| fig-height: 7
+
+plot_top_genes_umap(GD$Cadenza$space, GD$Cadenza$genes, "Cadenza", n_top = 10)
+```
+
+```{r}
+#| label: v2-norin-topgenes
+#| fig-cap: "V2b: Norin, same layout as Cadenza."
+#| fig-width: 8
+#| fig-height: 7
+
+plot_top_genes_umap(GD$Norin$space, GD$Norin$genes, "Norin", n_top = 10)
+```
+
+### V3 --- Distance distributions
+
+Histogram of full-space distances (the metric used for ranking, not the 2D UMAP distance).
+
+```{r}
+#| label: v3-distance-dist
+#| fig-cap: "V3: Distribution of RNA-protein distances. Full standardised space used for ranking (A4)."
+#| fig-width: 12
+#| fig-height: 4
+
+op <- par(mfrow = c(1, 2))
+for (nm in c("Cadenza", "Norin")) {
+  d <- GD[[nm]]$genes$d_full
+  hist(d, breaks = 30, col = "#2E86AB", border = "white",
+       main = paste(nm, "distance distribution"),
+       xlab = "RNA-Protein distance (full space)")
+  abline(v = mean(d), col = "#D1495B", lwd = 2.5, lty = 2)
+  abline(v = median(d), col = "#E8A33D", lwd = 2.5, lty = 2)
+  legend("topright", legend = c("Mean", "Median"), col = c("#D1495B", "#E8A33D"),
+         lty = 2, lwd = 2.5, cex = 0.8)
+}
+par(op)
+```
+
+### V3b --- Density distribution in UMAP space
+
+Where do RNA and protein cluster? Filled density contours show the concentration of genes in different regions of the manifold.
+
+```{r}
+#| label: v3b-density-plots
+#| fig-cap: "V3b: 2D density distributions of RNA (blue) and protein (orange) in shared UMAP space. Filled contours show concentration levels."
+#| fig-width: 14
+#| fig-height: 6
+
+# Prepare data for ggplot2: combine RNA and protein embeddings with labels
+density_data <- local({
+  rna_cad <- data.frame(
+    UMAP1 = GD$Cadenza$space$Er[, 1],
+    UMAP2 = GD$Cadenza$space$Er[, 2],
+    modality = "RNA",
+    variety = "Cadenza"
+  )
+  prot_cad <- data.frame(
+    UMAP1 = GD$Cadenza$space$Ep[, 1],
+    UMAP2 = GD$Cadenza$space$Ep[, 2],
+    modality = "Protein",
+    variety = "Cadenza"
+  )
+  rna_nor <- data.frame(
+    UMAP1 = GD$Norin$space$Er[, 1],
+    UMAP2 = GD$Norin$space$Er[, 2],
+    modality = "RNA",
+    variety = "Norin"
+  )
+  prot_nor <- data.frame(
+    UMAP1 = GD$Norin$space$Ep[, 1],
+    UMAP2 = GD$Norin$space$Ep[, 2],
+    modality = "Protein",
+    variety = "Norin"
+  )
+  rbind(rna_cad, prot_cad, rna_nor, prot_nor)
+})
+
+# Create plot with ggplot2: separate panels per variety, overlaid densities
+p <- ggplot(density_data, aes(x = UMAP1, y = UMAP2, fill = modality)) +
+  facet_wrap(~variety, ncol = 2) +
+  stat_density2d(geom = "polygon", alpha = 0.42, bins = 6, contour = TRUE) +
+  scale_fill_manual(
+    values = c("RNA" = "#4A90E2", "Protein" = "#F5A623"),
+    guide = guide_legend(title = "Modality", reverse = FALSE)
+  ) +
+  labs(
+    x = "UMAP 1",
+    y = "UMAP 2",
+    title = "Density: blue = RNA, orange = protein"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "gray30", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.2),
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+print(p)
+```
+
+### V4 --- Comparing full space, PCA, and UMAP distances
+
+Are the rankings stable across different projection methods? If so, the distance metric is robust.
+
+```{r}
+#| label: v4-correlation-comparisons
+#| fig-cap: "V4: Correlation of gene distances across spaces. All three methods rank genes similarly (high Spearman rank correlation), but full space is the most informative for ranking."
+#| fig-width: 12
+#| fig-height: 4
+
+op <- par(mfrow = c(1, 2))
+
+for (nm in c("Cadenza", "Norin")) {
+  d <- GD[[nm]]$genes
+
+  # Spearman rank correlations
+  r_full_pca  <- cor(d$d_full, d$d_pca2, method = "spearman")
+  r_full_umap <- cor(d$d_full, d$d_umap, method = "spearman")
+  r_pca_umap  <- cor(d$d_pca2, d$d_umap, method = "spearman")
+
+  # Plot: full vs PCA
+  plot(d$d_full, d$d_pca2, pch = 19, col = "#2E86AB", alpha = 0.5,
+       main = paste(nm, ": Full space vs PCA\nSpearman ρ =", round(r_full_pca, 3)),
+       xlab = "Distance (full standardised space)",
+       ylab = "Distance (top-2 PCA)")
+  abline(lm(d$d_pca2 ~ d$d_full), col = "#D1495B", lwd = 2)
+}
+
+par(op)
+```
+
+------------------------------------------------------------------------
+
+## Interpretation: Is the distance meaningful?
+
+### What the distance tells us
+
+The RNA-protein distance in the shared condition-profile space measures **how differently each gene's RNA and protein respond across experimental conditions**, scaled and centred so that:
+
+-   **Distance ≈ 0**: RNA and protein have nearly identical condition-response shapes (e.g., both peak under heat stress, dip under drought)
+-   **Distance \> mean**: Divergent response patterns (e.g., RNA goes up under drought, protein stays flat; or timing lag)
+-   The distance is in **standardised (z-score) units**, making it comparable across genes
+
+### Can we use it for "similarity"?
+
+**Yes, with caveats.** The distance ranks genes reproducibly (G4: split-half Spearman ρ = 0.997), and the pairing signal is real (G3: permutation p = 0.005). However:
+
+1.  **It does NOT distinguish regulation from kinetics** (G1: `lag_only` genes rank as discordant despite being mechanistically concordant). A high-distance gene is equally likely to be slow-turnover as genuinely decoupled.
+
+2.  **It ranks by response-shape similarity alone**, not by absolute RNA or protein level, absolute correlation, or fold-change agreement. Two genes with identical shapes but opposite signs (one up, one down) would have distance ≈ 0 because their *shapes* are concordant.
+
+3.  **The metric is one-directional**: we fit UMAP on RNA only, then project protein into that space. Protein's variance structure doesn't define the axes.
+
+### Full space vs PCA vs UMAP
+
+From G2 and V4:
+
+| Space                 | Use for ranking?        | AUC (discordant vs baseline) | Notes                                                                                          |
+|-----------------------|-------------------------|------------------------------|------------------------------------------------------------------------------------------------|
+| **Full standardised** | ✅ Yes (A4 validated)   | 0.820                        | Most informative, distance preserved exactly                                                   |
+| **Top-2 PCA**         | ✅ Yes (nearly as good) | 0.827                        | Minimal loss of ranking power; visualisable as 2D plot                                         |
+| **2D UMAP**           | ⚠️ Use with caution     | 0.799                        | Designed for local structure, not global distances; loses \~2% AUC but more intuitive visually |
+
+**Recommendation:**
+
+-   **For ranking and biological claims**: use `d_full` (full standardised space). Distance is mathematically exact, not approximate.
+-   **For exploration and talks**: the top-2 PCA plot is essentially equivalent to full space for ranking (AUC 0.827 vs 0.820) and far clearer to present than a 2D scatter.
+-   **For 2D visualisation only**: UMAP is fine for showing "here are the genes" but the 2D distances should not be interpreted as global distances. Use UMAP for illustration, full space for claims.
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+## 10. Assumption validation summary
 
 ```{r}
 #| label: assumption-summary
@@ -480,7 +791,7 @@ knitr::kable(data.frame(
 
 ------------------------------------------------------------------------
 
-## 10. What is safe to claim
+## 11. What is safe to claim
 
 ```{r}
 #| label: safe-to-claim-inputs
