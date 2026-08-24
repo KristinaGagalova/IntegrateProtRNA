@@ -205,6 +205,56 @@ euclid <- function(A, B, k = NULL) {
   sqrt(rowSums((A - B)^2))
 }
 
+#' Calculate correlation and amplitude for each gene
+#' Returns: correlation (directional concordance), amplitude ratio (relative response magnitude)
+gene_metrics <- function(R_centered, P_centered) {
+  # Correlation: directional concordance (correlation of response profiles)
+  cors <- sapply(seq_len(nrow(R_centered)), function(i) {
+    cor(R_centered[i, ], P_centered[i, ], method = "pearson")
+  })
+  cors[is.na(cors)] <- 0  # Handle constant profiles
+
+  # Amplitude: log2 ratio of response magnitudes
+  # ||R|| = sqrt(sum of squared values across conditions)
+  R_norm <- sqrt(rowSums(R_centered^2))
+  P_norm <- sqrt(rowSums(P_centered^2))
+  # Avoid log(0); replace with 0
+  amps <- ifelse(R_norm > 1e-10 & P_norm > 1e-10,
+                 log2(P_norm / R_norm),
+                 0)
+
+  data.frame(correlation = cors, amplitude = amps)
+}
+
+#' Calculate infection-response contrasts (Infected - Control) for each timepoint
+#' Returns condition means for the 4 timepoint-level contrasts
+infection_contrasts <- function(counts, meta) {
+  # Assumes meta has columns: condition, treatment, timepoint
+  # where treatment = "infected" or "control"
+
+  timepoints <- sort(unique(meta$timepoint))
+  contrasts <- data.frame()
+
+  for (tp in timepoints) {
+    idx_inf <- meta$treatment == "infected" & meta$timepoint == tp
+    idx_ctl <- meta$treatment == "control"  & meta$timepoint == tp
+
+    if (sum(idx_inf) > 0 && sum(idx_ctl) > 0) {
+      mean_inf <- rowMeans(counts[, idx_inf, drop = FALSE])
+      mean_ctl <- rowMeans(counts[, idx_ctl, drop = FALSE])
+      contrast <- mean_inf - mean_ctl
+
+      if (nrow(contrasts) == 0) {
+        contrasts <- data.frame(contrast)
+        colnames(contrasts)[1] <- paste0("dpi_", tp)
+      } else {
+        contrasts[[paste0("dpi_", tp)]] <- contrast
+      }
+    }
+  }
+  contrasts
+}
+
 #' UMAP fit on RNA, protein transformed into the same embedding -- matching
 #' the source notebook's asymmetric fit/transform (never a joint/symmetric
 #' fit, which would let protein leak into the axes it is being scored against).
@@ -357,6 +407,9 @@ gene_distance_real <- function(v, n_perm = 199, seed = 1) {
   d_full <- euclid(sp$Rs, sp$Ps)
   d_pca2 <- euclid(sp$Zr, sp$Zp, k = 2)
 
+  # Calculate correlation and amplitude for each gene
+  metrics <- gene_metrics(sp$Rs, sp$Ps)
+
   # UMAP fit on RNA, transform protein (asymmetric, never joint)
   nn <- max(2, min(15, nrow(sp$Rs) %/% 4))
   set.seed(seed)
@@ -371,13 +424,74 @@ gene_distance_real <- function(v, n_perm = 199, seed = 1) {
   obs  <- mean(d_full)
   p_perm <- (sum(null <= obs) + 1) / (n_perm + 1)
 
-  list(genes = data.frame(gene_id = common, d_full = d_full,
-                          d_pca2 = d_pca2, d_umap = d_umap),
+  list(genes = data.frame(gene_id = common,
+                          d_full = d_full,
+                          d_pca2 = d_pca2,
+                          d_umap = d_umap,
+                          correlation = metrics$correlation,
+                          amplitude = metrics$amplitude),
        space = list(Er = Er, Ep = Ep),
        obs = obs, null = null, p_perm = p_perm, n_genes = length(common))
 }
 
 GD <- setNames(Map(function(v, s) gene_distance_real(v, seed = s), REAL, seq_along(REAL)), names(REAL))
+
+#' Infection-response contrast analysis: compare Infected - Control at each timepoint
+#' Instead of 8 condition means, use 4-point infection-response trajectories
+gene_distance_infection_contrast <- function(v, n_perm = 199, seed = 1) {
+  # Extract infection and control means for each timepoint
+  # v$meta should have: condition, treatment (infected/control), timepoint
+
+  common <- intersect(rownames(v$qc_rna$vst), rownames(v$imputed$mixed))
+
+  # Verify 1:1 mapping
+  stopifnot(
+    "Protein matrix must have unique row identifiers (assumption A1)" =
+      length(unique(rownames(v$imputed$mixed))) == nrow(v$imputed$mixed)
+  )
+
+  # Calculate contrasts for RNA and protein
+  R_contrast <- infection_contrasts(v$qc_rna$vst[common, ], v$meta)
+  P_contrast <- infection_contrasts(v$imputed$mixed[common, ], v$meta)
+
+  # If contrasts are empty or don't match, return NULL (metadata may not have treatment column)
+  if (nrow(R_contrast) == 0 || nrow(P_contrast) == 0 || ncol(R_contrast) != ncol(P_contrast)) {
+    return(NULL)
+  }
+
+  # Build shared space on contrasts
+  sp <- build_shared_space(R_contrast, P_contrast)
+  d_full <- euclid(sp$Rs, sp$Ps)
+  metrics <- gene_metrics(sp$Rs, sp$Ps)
+
+  # UMAP
+  nn <- max(2, min(15, nrow(sp$Rs) %/% 4))
+  set.seed(seed)
+  umap_fit <- uwot::umap(sp$Rs, n_neighbors = nn, min_dist = 0.10, n_components = 2,
+                         metric = "euclidean", ret_model = TRUE)
+  Er <- umap_fit$embedding
+  Ep <- uwot::umap_transform(sp$Ps, umap_fit)
+  d_umap <- sqrt(rowSums((Er - Ep)^2))
+
+  set.seed(seed)
+  null <- replicate(n_perm, mean(euclid(sp$Rs, sp$Ps[sample(nrow(sp$Ps)), , drop = FALSE])))
+  obs <- mean(d_full)
+  p_perm <- (sum(null <= obs) + 1) / (n_perm + 1)
+
+  list(genes = data.frame(gene_id = common,
+                          d_full = d_full,
+                          d_umap = d_umap,
+                          correlation = metrics$correlation,
+                          amplitude = metrics$amplitude),
+       space = list(Er = Er, Ep = Ep),
+       obs = obs, null = null, p_perm = p_perm, n_genes = length(common))
+}
+
+# Try to compute infection-contrast version (may be NULL if metadata lacks treatment info)
+GD_contrast <- tryCatch(
+  setNames(Map(function(v, s) gene_distance_infection_contrast(v, seed = s), REAL, seq_along(REAL)), names(REAL)),
+  error = function(e) NULL
+)
 ```
 
 ```{r}
@@ -518,6 +632,115 @@ knitr::kable(TB_nor$most_discordant, row.names = FALSE,
             caption = "Norin: 15 genes with the largest RNA<->protein condition-profile distance.")
 knitr::kable(TB_nor$most_concordant, row.names = FALSE,
             caption = "Norin: 15 genes with the smallest RNA<->protein condition-profile distance.")
+```
+
+------------------------------------------------------------------------
+
+## 8b. Three-metric decomposition: Distance, Correlation, Amplitude
+
+A single distance number masks biological diversity. The same high distance can arise from different mechanisms:
+
+-   **High distance + high correlation**: same response pattern, different amplitude (buffering/scaling)
+-   **High distance + low/negative correlation**: opposite or independent regulation
+-   **Low distance + high correlation**: strong RNA-protein concordance
+
+Breaking d_full into three complementary metrics reveals which genes have which behaviour.
+
+```{r}
+#| label: decomposition-table
+
+# For each variety, show top discordant genes with their three metrics
+for (nm in c("Cadenza", "Norin")) {
+  d <- GD[[nm]]$genes
+  d <- d[order(-d$d_full), ]
+
+  cat("\n**", nm, ": top 10 most-discordant genes with decomposed metrics**\n\n", sep = "")
+
+  top10 <- head(d, 10)[, c("gene_id", "d_full", "correlation", "amplitude")]
+  top10$d_full <- round(top10$d_full, 3)
+  top10$correlation <- round(top10$correlation, 3)
+  top10$amplitude <- round(top10$amplitude, 3)
+
+  print(knitr::kable(top10, row.names = FALSE, caption = paste(nm, "decomposition")))
+  cat("\n")
+}
+```
+
+### Interpretation of the three metrics
+
+| d_full   | correlation  | amplitude | biological meaning                                       |
+|----------|--------------|-----------|----------------------------------------------------------|
+| low      | high         | \~0       | identical response shape and strength                    |
+| moderate | high         | ±large    | same response pattern, protein buffered or amplified     |
+| high     | high         | ±large    | similar pattern but large amplitude difference (unusual) |
+| high     | low/negative | any       | opposite or orthogonal regulation; genuine decoupling    |
+| high     | moderate     | any       | delayed/shifted response; kinetic lag                    |
+
+------------------------------------------------------------------------
+
+## 8c. Infection-response contrast analysis (optional)
+
+The main analysis (§8) uses all 8 condition means (2 treatments × 4 timepoints). But for the disease biology, a cleaner question is:
+
+**Does protein reproduce the infection-induced change observed at the transcript level?**
+
+This version uses only the 4-point infection-response trajectories:
+
+$$\Delta_t^{\text{RNA}} = \text{RNA}_{\text{infected}}(t) - \text{RNA}_{\text{control}}(t)$$ $$\Delta_t^{\text{protein}} = \text{Protein}_{\text{infected}}(t) - \text{Protein}_{\text{control}}(t)$$
+
+This avoids conflating normal developmental time-effects with infection-specific effects.
+
+```{r}
+#| label: infection-contrast-check
+
+if (!is.null(GD_contrast) && !all(sapply(GD_contrast, is.null))) {
+  cat("✓ Infection-response contrast analysis computed.\n\n")
+  for (nm in names(GD_contrast)) {
+    if (!is.null(GD_contrast[[nm]])) {
+      cat("**", nm, ":**\n", sep = "")
+      d <- GD_contrast[[nm]]$genes
+      cat("  Genes:", nrow(d), "\n")
+      cat("  Mean distance (contrasts):", round(GD_contrast[[nm]]$obs, 3), "\n")
+      cat("  Permutation p:", GD_contrast[[nm]]$p_perm, "\n\n")
+    }
+  }
+} else {
+  cat("⚠️ Infection-response contrast analysis not available.\n",
+      "Metadata may not have 'treatment' column (infected vs control).\n")
+}
+```
+
+```{r}
+#| label: infection-contrast-compare
+#| fig-cap: "Comparison of 8-condition vs 4-contrast distance rankings. High correlation means the two metrics agree on which genes are discordant; divergence identifies genes sensitive to developmental vs infection effects."
+#| fig-width: 10
+#| fig-height: 6
+
+if (!is.null(GD_contrast) && !all(sapply(GD_contrast, is.null))) {
+  op <- par(mfrow = c(1, 2))
+
+  for (nm in names(GD_contrast)) {
+    if (!is.null(GD_contrast[[nm]])) {
+      d_main <- GD[[nm]]$genes
+      d_contrast <- GD_contrast[[nm]]$genes
+
+      # Merge on gene_id
+      merged <- merge(d_main[, c("gene_id", "d_full")],
+                      d_contrast[, c("gene_id", "d_full")],
+                      by = "gene_id", suffixes = c("_main", "_contrast"))
+
+      r_rank <- cor(rank(-merged$d_full_main), rank(-merged$d_full_contrast), method = "spearman")
+
+      plot(merged$d_full_main, merged$d_full_contrast, pch = 19, col = "#2E86AB", alpha = 0.5,
+           main = paste(nm, "\nSpearman ρ =", round(r_rank, 3)),
+           xlab = "Distance (8 conditions)", ylab = "Distance (4 infection contrasts)")
+      abline(0, 1, col = "gray", lty = 2, lwd = 1)
+      abline(lm(merged$d_full_contrast ~ merged$d_full_main), col = "#D1495B", lwd = 2)
+    }
+  }
+
+  par(op)
+}
 ```
 
 ------------------------------------------------------------------------

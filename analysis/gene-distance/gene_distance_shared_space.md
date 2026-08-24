@@ -17,6 +17,10 @@ Kristina Gagalova
   data](#g3-permutation-null-on-real-data)
 - [7. G4 — Replicate-level stability](#g4-replicate-level-stability)
 - [8. Apply to real data](#apply-to-real-data)
+- [8b. Three-metric decomposition: Distance, Correlation,
+  Amplitude](#b.-three-metric-decomposition-distance-correlation-amplitude)
+  - [Interpretation of the three
+    metrics](#interpretation-of-the-three-metrics)
 - [9. Visualizations: UMAP in shared
   space](#visualizations-umap-in-shared-space)
   - [V1 — Shared UMAP embeddings, real
@@ -336,6 +340,56 @@ euclid <- function(A, B, k = NULL) {
   sqrt(rowSums((A - B)^2))
 }
 
+#' Calculate correlation and amplitude for each gene
+#' Returns: correlation (directional concordance), amplitude ratio (relative response magnitude)
+gene_metrics <- function(R_centered, P_centered) {
+  # Correlation: directional concordance (correlation of response profiles)
+  cors <- sapply(seq_len(nrow(R_centered)), function(i) {
+    cor(R_centered[i, ], P_centered[i, ], method = "pearson")
+  })
+  cors[is.na(cors)] <- 0  # Handle constant profiles
+
+  # Amplitude: log2 ratio of response magnitudes
+  # ||R|| = sqrt(sum of squared values across conditions)
+  R_norm <- sqrt(rowSums(R_centered^2))
+  P_norm <- sqrt(rowSums(P_centered^2))
+  # Avoid log(0); replace with 0
+  amps <- ifelse(R_norm > 1e-10 & P_norm > 1e-10,
+                 log2(P_norm / R_norm),
+                 0)
+
+  data.frame(correlation = cors, amplitude = amps)
+}
+
+#' Calculate infection-response contrasts (Infected - Control) for each timepoint
+#' Returns condition means for the 4 timepoint-level contrasts
+infection_contrasts <- function(counts, meta) {
+  # Assumes meta has columns: condition, treatment, timepoint
+  # where treatment = "infected" or "control"
+
+  timepoints <- sort(unique(meta$timepoint))
+  contrasts <- data.frame()
+
+  for (tp in timepoints) {
+    idx_inf <- meta$treatment == "infected" & meta$timepoint == tp
+    idx_ctl <- meta$treatment == "control"  & meta$timepoint == tp
+
+    if (sum(idx_inf) > 0 && sum(idx_ctl) > 0) {
+      mean_inf <- rowMeans(counts[, idx_inf, drop = FALSE])
+      mean_ctl <- rowMeans(counts[, idx_ctl, drop = FALSE])
+      contrast <- mean_inf - mean_ctl
+
+      if (nrow(contrasts) == 0) {
+        contrasts <- data.frame(contrast)
+        colnames(contrasts)[1] <- paste0("dpi_", tp)
+      } else {
+        contrasts[[paste0("dpi_", tp)]] <- contrast
+      }
+    }
+  }
+  contrasts
+}
+
 #' UMAP fit on RNA, protein transformed into the same embedding -- matching
 #' the source notebook's asymmetric fit/transform (never a joint/symmetric
 #' fit, which would let protein leak into the axes it is being scored against).
@@ -520,6 +574,9 @@ gene_distance_real <- function(v, n_perm = 199, seed = 1) {
   d_full <- euclid(sp$Rs, sp$Ps)
   d_pca2 <- euclid(sp$Zr, sp$Zp, k = 2)
 
+  # Calculate correlation and amplitude for each gene
+  metrics <- gene_metrics(sp$Rs, sp$Ps)
+
   # UMAP fit on RNA, transform protein (asymmetric, never joint)
   nn <- max(2, min(15, nrow(sp$Rs) %/% 4))
   set.seed(seed)
@@ -534,8 +591,12 @@ gene_distance_real <- function(v, n_perm = 199, seed = 1) {
   obs  <- mean(d_full)
   p_perm <- (sum(null <= obs) + 1) / (n_perm + 1)
 
-  list(genes = data.frame(gene_id = common, d_full = d_full,
-                          d_pca2 = d_pca2, d_umap = d_umap),
+  list(genes = data.frame(gene_id = common,
+                          d_full = d_full,
+                          d_pca2 = d_pca2,
+                          d_umap = d_umap,
+                          correlation = metrics$correlation,
+                          amplitude = metrics$amplitude),
        space = list(Er = Er, Ep = Ep),
        obs = obs, null = null, p_perm = p_perm, n_genes = length(common))
 }
@@ -726,23 +787,23 @@ knitr::kable(TB_cad$most_discordant, row.names = FALSE,
             caption = "Cadenza: 15 genes with the largest RNA<->protein condition-profile distance.")
 ```
 
-| gene_id                            |   d_full |    d_pca2 |     d_umap |
-|:-----------------------------------|---------:|----------:|-----------:|
-| TraesCAD_scaffold_014747_01G000100 | 14.58265 | 14.475242 |  2.3657339 |
-| TraesCAD_scaffold_133124_01G000100 | 13.46543 | 12.019077 |  1.9724290 |
-| TraesCAD_scaffold_116541_01G000100 | 13.42158 | 12.097656 |  5.6464228 |
-| TraesCAD_scaffold_146252_01G000100 | 12.98171 |  7.499297 | 14.0091441 |
-| TraesCAD_scaffold_129059_01G000100 | 12.07514 |  6.287907 |  0.5496855 |
-| TraesCAD_scaffold_004054_01G000200 | 11.69405 | 11.410600 |  4.0967407 |
-| TraesCAD_scaffold_086045_01G000100 | 10.90339 |  8.892567 | 12.5607742 |
-| TraesCAD_scaffold_070666_01G000100 | 10.83616 | 10.347964 |  2.4119324 |
-| TraesCAD_scaffold_054259_01G000200 | 10.77012 |  4.470433 |  3.7250462 |
-| TraesCAD_scaffold_033501_01G000300 | 10.73777 |  5.949084 |  1.1749163 |
-| TraesCAD_scaffold_003324_01G000300 | 10.67303 | 10.132232 |  5.8074039 |
-| TraesCAD_scaffold_111708_01G000100 | 10.53067 |  9.694695 |  2.1611899 |
-| TraesCAD_scaffold_055929_01G000400 | 10.41145 |  9.304480 | 10.1569778 |
-| TraesCAD_scaffold_078281_01G000100 | 10.28404 |  9.888884 |  3.9489334 |
-| TraesCAD_scaffold_045162_01G000100 | 10.25314 |  9.683636 |  5.2107489 |
+| gene_id                            |   d_full |    d_pca2 |     d_umap | correlation |  amplitude |
+|:-----------------------------------|---------:|----------:|-----------:|------------:|-----------:|
+| TraesCAD_scaffold_014747_01G000100 | 14.58265 | 14.475242 |  2.3657339 |   0.9061702 | -2.1774305 |
+| TraesCAD_scaffold_133124_01G000100 | 13.46543 | 12.019077 |  1.9724290 |   0.4208656 | -0.5813689 |
+| TraesCAD_scaffold_116541_01G000100 | 13.42158 | 12.097656 |  5.6464228 |  -0.2217841 |  0.0811294 |
+| TraesCAD_scaffold_146252_01G000100 | 12.98171 |  7.499297 | 14.0091441 |  -0.4626135 | -0.3808938 |
+| TraesCAD_scaffold_129059_01G000100 | 12.07514 |  6.287907 |  0.5496855 |   0.8112003 |  1.2487586 |
+| TraesCAD_scaffold_004054_01G000200 | 11.69405 | 11.410600 |  4.0967407 |  -0.2543228 |  1.1620031 |
+| TraesCAD_scaffold_086045_01G000100 | 10.90339 |  8.892567 | 12.5607742 |  -0.3549208 | -0.2021084 |
+| TraesCAD_scaffold_070666_01G000100 | 10.83616 | 10.347964 |  2.4119324 |  -0.0695196 |  0.9572901 |
+| TraesCAD_scaffold_054259_01G000200 | 10.77012 |  4.470433 |  3.7250462 |  -0.2541636 |  2.4643760 |
+| TraesCAD_scaffold_033501_01G000300 | 10.73777 |  5.949084 |  1.1749163 |   0.1943790 | -0.0447390 |
+| TraesCAD_scaffold_003324_01G000300 | 10.67303 | 10.132232 |  5.8074039 |  -0.3497620 |  1.7236806 |
+| TraesCAD_scaffold_111708_01G000100 | 10.53067 |  9.694695 |  2.1611899 |   0.6299001 | -1.3882058 |
+| TraesCAD_scaffold_055929_01G000400 | 10.41145 |  9.304480 | 10.1569778 |  -0.6270213 | -0.5273418 |
+| TraesCAD_scaffold_078281_01G000100 | 10.28404 |  9.888884 |  3.9489334 |  -0.1407167 |  0.7715232 |
+| TraesCAD_scaffold_045162_01G000100 | 10.25314 |  9.683636 |  5.2107489 |   0.4418092 | -1.6304404 |
 
 Cadenza: 15 genes with the largest RNA\<-\>protein condition-profile
 distance.
@@ -752,23 +813,23 @@ knitr::kable(TB_cad$most_concordant, row.names = FALSE,
             caption = "Cadenza: 15 genes with the smallest RNA<->protein condition-profile distance.")
 ```
 
-| gene_id                            |    d_full |    d_pca2 |    d_umap |
-|:-----------------------------------|----------:|----------:|----------:|
-| TraesCAD_scaffold_038576_01G000100 | 0.3320594 | 0.2223863 | 0.3600272 |
-| TraesCAD_scaffold_052346_01G000400 | 0.3461207 | 0.1039178 | 0.6840019 |
-| TraesCAD_scaffold_021918_01G000100 | 0.3723484 | 0.0243553 | 0.5830958 |
-| TraesCAD_scaffold_031505_01G000300 | 0.3753941 | 0.2407662 | 1.5627541 |
-| TraesCAD_scaffold_013569_01G000100 | 0.3801392 | 0.0678640 | 0.4268784 |
-| TraesCAD_scaffold_033939_01G000100 | 0.3813461 | 0.2157055 | 1.1792848 |
-| TraesCAD_scaffold_049099_01G000200 | 0.3836871 | 0.3402093 | 0.8953310 |
-| TraesCAD_scaffold_054741_01G000200 | 0.3956708 | 0.1252366 | 0.4805051 |
-| TraesCAD_scaffold_056084_01G000100 | 0.4139949 | 0.2143559 | 0.3528777 |
-| TraesCAD_scaffold_006030_01G000100 | 0.4190055 | 0.1167284 | 0.9587574 |
-| TraesCAD_scaffold_133213_01G000100 | 0.4212843 | 0.2471508 | 0.6597650 |
-| TraesCAD_scaffold_012263_01G000100 | 0.4384106 | 0.2282005 | 0.8391910 |
-| TraesCAD_scaffold_153650_01G000100 | 0.4397477 | 0.2696171 | 0.3331563 |
-| TraesCAD_scaffold_034146_01G000800 | 0.4432211 | 0.1519103 | 0.4861834 |
-| TraesCAD_scaffold_099972_01G000200 | 0.4564836 | 0.1383663 | 0.2545443 |
+| gene_id                            |    d_full |    d_pca2 |    d_umap | correlation |  amplitude |
+|:-----------------------------------|----------:|----------:|----------:|------------:|-----------:|
+| TraesCAD_scaffold_038576_01G000100 | 0.3320594 | 0.2223863 | 0.3600272 |   0.9273678 |  0.0085526 |
+| TraesCAD_scaffold_052346_01G000400 | 0.3461207 | 0.1039178 | 0.6840019 |   0.3693726 |  0.1578930 |
+| TraesCAD_scaffold_021918_01G000100 | 0.3723484 | 0.0243553 | 0.5830958 |   0.9420747 |  0.0837291 |
+| TraesCAD_scaffold_031505_01G000300 | 0.3753941 | 0.2407662 | 1.5627541 |   0.8538846 | -0.3104532 |
+| TraesCAD_scaffold_013569_01G000100 | 0.3801392 | 0.0678640 | 0.4268784 |   0.8132702 |  0.4999251 |
+| TraesCAD_scaffold_033939_01G000100 | 0.3813461 | 0.2157055 | 1.1792848 |   0.9270704 | -0.2945736 |
+| TraesCAD_scaffold_049099_01G000200 | 0.3836871 | 0.3402093 | 0.8953310 |   0.8244191 |  0.1483794 |
+| TraesCAD_scaffold_054741_01G000200 | 0.3956708 | 0.1252366 | 0.4805051 |   0.8212844 | -0.1461318 |
+| TraesCAD_scaffold_056084_01G000100 | 0.4139949 | 0.2143559 | 0.3528777 |   0.9108897 | -0.2131325 |
+| TraesCAD_scaffold_006030_01G000100 | 0.4190055 | 0.1167284 | 0.9587574 |   0.9170550 | -0.0198177 |
+| TraesCAD_scaffold_133213_01G000100 | 0.4212843 | 0.2471508 | 0.6597650 |   0.8161074 |  0.4892320 |
+| TraesCAD_scaffold_012263_01G000100 | 0.4384106 | 0.2282005 | 0.8391910 |   0.7327938 |  0.1481034 |
+| TraesCAD_scaffold_153650_01G000100 | 0.4397477 | 0.2696171 | 0.3331563 |   0.8116068 |  0.1318558 |
+| TraesCAD_scaffold_034146_01G000800 | 0.4432211 | 0.1519103 | 0.4861834 |   0.4308411 |  0.5617491 |
+| TraesCAD_scaffold_099972_01G000200 | 0.4564836 | 0.1383663 | 0.2545443 |   0.6464594 |  0.1419196 |
 
 Cadenza: 15 genes with the smallest RNA\<-\>protein condition-profile
 distance.
@@ -778,23 +839,23 @@ knitr::kable(TB_nor$most_discordant, row.names = FALSE,
             caption = "Norin: 15 genes with the largest RNA<->protein condition-profile distance.")
 ```
 
-| gene_id               |   d_full |    d_pca2 |    d_umap |
-|:----------------------|---------:|----------:|----------:|
-| TraesNOR1D03G00570400 | 15.02558 |  3.893949 |  4.891499 |
-| TraesNOR6A03G03297390 | 14.10718 | 10.185115 |  4.876135 |
-| TraesNOR2B03G00927270 | 14.05256 |  9.510851 |  3.986484 |
-| TraesNOR2D03G01226140 | 13.03249 |  9.846638 |  5.104037 |
-| TraesNOR1A03G00156570 | 12.85264 | 10.179145 | 11.012752 |
-| TraesNOR3D03G01932610 | 12.84277 | 12.023901 |  6.074400 |
-| TraesNOR2A03G00800550 | 12.50523 |  9.526019 |  9.645459 |
-| TraesNOR4D03G02551270 | 12.35318 | 11.492479 |  7.378051 |
-| TraesNOR7D03G04390710 | 12.27664 | 11.351402 |  3.807223 |
-| TraesNOR7A03G03920620 | 12.23833 |  5.142548 |  6.133183 |
-| TraesNOR6A03G03323590 | 11.90557 |  8.263454 |  7.847375 |
-| TraesNOR7B03G04214550 | 11.89695 | 11.446567 |  3.176004 |
-| TraesNOR1A03G00091890 | 11.76049 | 10.866732 |  7.409615 |
-| TraesNOR2D03G01170600 | 11.74577 | 10.731394 |  6.482513 |
-| TraesNOR7A03G03913820 | 11.71902 |  8.988329 |  4.581833 |
+| gene_id               |   d_full |    d_pca2 |    d_umap | correlation |  amplitude |
+|:----------------------|---------:|----------:|----------:|------------:|-----------:|
+| TraesNOR1D03G00570400 | 15.02558 |  3.893949 |  4.891499 |  -0.0626448 |  1.4259658 |
+| TraesNOR6A03G03297390 | 14.10718 | 10.185115 |  4.876135 |  -0.2789142 |  0.7465790 |
+| TraesNOR2B03G00927270 | 14.05256 |  9.510851 |  3.986484 |   0.2967501 |  3.9658209 |
+| TraesNOR2D03G01226140 | 13.03249 |  9.846638 |  5.104037 |  -0.1558289 |  2.5691946 |
+| TraesNOR1A03G00156570 | 12.85264 | 10.179145 | 11.012752 |   0.3194219 |  0.7387961 |
+| TraesNOR3D03G01932610 | 12.84277 | 12.023901 |  6.074400 |   0.1232775 | -0.9050636 |
+| TraesNOR2A03G00800550 | 12.50523 |  9.526019 |  9.645459 |  -0.7827240 |  1.5097885 |
+| TraesNOR4D03G02551270 | 12.35318 | 11.492479 |  7.378051 |  -0.7200042 | -0.1133120 |
+| TraesNOR7D03G04390710 | 12.27664 | 11.351402 |  3.807223 |   0.6483526 | -1.6222463 |
+| TraesNOR7A03G03920620 | 12.23833 |  5.142548 |  6.133183 |  -0.3505449 |  1.6776861 |
+| TraesNOR6A03G03323590 | 11.90557 |  8.263454 |  7.847375 |  -0.3421360 |  3.1282067 |
+| TraesNOR7B03G04214550 | 11.89695 | 11.446567 |  3.176004 |   0.7576481 | -1.3974439 |
+| TraesNOR1A03G00091890 | 11.76049 | 10.866732 |  7.409615 |  -0.5678999 | -0.4247522 |
+| TraesNOR2D03G01170600 | 11.74577 | 10.731394 |  6.482513 |   0.0120591 | -0.5085356 |
+| TraesNOR7A03G03913820 | 11.71902 |  8.988329 |  4.581833 |  -0.2717220 |  0.3850277 |
 
 Norin: 15 genes with the largest RNA\<-\>protein condition-profile
 distance.
@@ -804,26 +865,110 @@ knitr::kable(TB_nor$most_concordant, row.names = FALSE,
             caption = "Norin: 15 genes with the smallest RNA<->protein condition-profile distance.")
 ```
 
-| gene_id               |    d_full |    d_pca2 |    d_umap |
-|:----------------------|----------:|----------:|----------:|
-| TraesNOR3A03G01455230 | 0.3198929 | 0.0642875 | 0.2819026 |
-| TraesNOR5D03G03099340 | 0.3819582 | 0.2654183 | 0.2613097 |
-| TraesNOR6B03G03594350 | 0.4092053 | 0.1745770 | 0.3085167 |
-| TraesNOR7D03G04462700 | 0.4488227 | 0.3170282 | 1.1204432 |
-| TraesNOR4A03G02179410 | 0.4504038 | 0.4095664 | 0.8385381 |
-| TraesNORUn03G04756130 | 0.4810398 | 0.1520531 | 0.3105033 |
-| TraesNOR3B03G01612090 | 0.5017156 | 0.2577880 | 0.9370760 |
-| TraesNOR2D03G01314180 | 0.5031233 | 0.2400009 | 0.8241532 |
-| TraesNOR3D03G01917840 | 0.5073714 | 0.2782908 | 1.8957432 |
-| TraesNORUn03G04556950 | 0.5097156 | 0.3569833 | 1.1144144 |
-| TraesNOR5D03G03235660 | 0.5200205 | 0.2069519 | 0.3701004 |
-| TraesNOR5A03G02733810 | 0.5273895 | 0.4099040 | 0.2313463 |
-| TraesNOR7D03G04390410 | 0.5275586 | 0.1927471 | 0.4816958 |
-| TraesNOR1D03G00560520 | 0.5289193 | 0.2828857 | 0.5918853 |
-| TraesNOR6D03G03742630 | 0.5355704 | 0.3224174 | 0.5759194 |
+| gene_id               |    d_full |    d_pca2 |    d_umap | correlation |  amplitude |
+|:----------------------|----------:|----------:|----------:|------------:|-----------:|
+| TraesNOR3A03G01455230 | 0.3198929 | 0.0642875 | 0.2819026 |   0.9492192 | -0.0663763 |
+| TraesNOR5D03G03099340 | 0.3819582 | 0.2654183 | 0.2613097 |   0.9544345 | -0.1586547 |
+| TraesNOR6B03G03594350 | 0.4092053 | 0.1745770 | 0.3085167 |   0.8688774 |  0.5033650 |
+| TraesNOR7D03G04462700 | 0.4488227 | 0.3170282 | 1.1204432 |   0.8223209 |  0.3053959 |
+| TraesNOR4A03G02179410 | 0.4504038 | 0.4095664 | 0.8385381 |   0.9145572 | -0.2182271 |
+| TraesNORUn03G04756130 | 0.4810398 | 0.1520531 | 0.3105033 |   0.9138537 | -0.0012103 |
+| TraesNOR3B03G01612090 | 0.5017156 | 0.2577880 | 0.9370760 |   0.6969435 | -0.1925588 |
+| TraesNOR2D03G01314180 | 0.5031233 | 0.2400009 | 0.8241532 |   0.7303275 |  0.8852612 |
+| TraesNOR3D03G01917840 | 0.5073714 | 0.2782908 | 1.8957432 |   0.7718713 | -0.7103490 |
+| TraesNORUn03G04556950 | 0.5097156 | 0.3569833 | 1.1144144 |   0.8155968 | -0.7000619 |
+| TraesNOR5D03G03235660 | 0.5200205 | 0.2069519 | 0.3701004 |   0.8110015 |  0.1060114 |
+| TraesNOR5A03G02733810 | 0.5273895 | 0.4099040 | 0.2313463 |   0.6981259 | -0.3755882 |
+| TraesNOR7D03G04390410 | 0.5275586 | 0.1927471 | 0.4816958 |   0.7505460 | -0.9049114 |
+| TraesNOR1D03G00560520 | 0.5289193 | 0.2828857 | 0.5918853 |   0.6256649 |  0.1821194 |
+| TraesNOR6D03G03742630 | 0.5355704 | 0.3224174 | 0.5759194 |   0.9284549 |  0.4215877 |
 
 Norin: 15 genes with the smallest RNA\<-\>protein condition-profile
 distance.
+
+------------------------------------------------------------------------
+
+## 8b. Three-metric decomposition: Distance, Correlation, Amplitude
+
+A single distance number masks biological diversity. The same high
+distance can arise from different mechanisms:
+
+- **High distance + high correlation**: same response pattern, different
+  amplitude (buffering/scaling)
+- **High distance + low/negative correlation**: opposite or independent
+  regulation
+- **Low distance + high correlation**: strong RNA-protein concordance
+
+Breaking d_full into three complementary metrics reveals which genes
+have which behaviour.
+
+``` r
+# For each variety, show top discordant genes with their three metrics
+for (nm in c("Cadenza", "Norin")) {
+  d <- GD[[nm]]$genes
+  d <- d[order(-d$d_full), ]
+
+  cat("\n**", nm, ": top 10 most-discordant genes with decomposed metrics**\n\n", sep = "")
+
+  top10 <- head(d, 10)[, c("gene_id", "d_full", "correlation", "amplitude")]
+  top10$d_full <- round(top10$d_full, 3)
+  top10$correlation <- round(top10$correlation, 3)
+  top10$amplitude <- round(top10$amplitude, 3)
+
+  print(knitr::kable(top10, row.names = FALSE, caption = paste(nm, "decomposition")))
+  cat("\n")
+}
+```
+
+
+    **Cadenza: top 10 most-discordant genes with decomposed metrics**
+
+
+
+    Table: Cadenza decomposition
+
+    |gene_id                            | d_full| correlation| amplitude|
+    |:----------------------------------|------:|-----------:|---------:|
+    |TraesCAD_scaffold_014747_01G000100 | 14.583|       0.906|    -2.177|
+    |TraesCAD_scaffold_133124_01G000100 | 13.465|       0.421|    -0.581|
+    |TraesCAD_scaffold_116541_01G000100 | 13.422|      -0.222|     0.081|
+    |TraesCAD_scaffold_146252_01G000100 | 12.982|      -0.463|    -0.381|
+    |TraesCAD_scaffold_129059_01G000100 | 12.075|       0.811|     1.249|
+    |TraesCAD_scaffold_004054_01G000200 | 11.694|      -0.254|     1.162|
+    |TraesCAD_scaffold_086045_01G000100 | 10.903|      -0.355|    -0.202|
+    |TraesCAD_scaffold_070666_01G000100 | 10.836|      -0.070|     0.957|
+    |TraesCAD_scaffold_054259_01G000200 | 10.770|      -0.254|     2.464|
+    |TraesCAD_scaffold_033501_01G000300 | 10.738|       0.194|    -0.045|
+
+
+    **Norin: top 10 most-discordant genes with decomposed metrics**
+
+
+
+    Table: Norin decomposition
+
+    |gene_id               | d_full| correlation| amplitude|
+    |:---------------------|------:|-----------:|---------:|
+    |TraesNOR1D03G00570400 | 15.026|      -0.063|     1.426|
+    |TraesNOR6A03G03297390 | 14.107|      -0.279|     0.747|
+    |TraesNOR2B03G00927270 | 14.053|       0.297|     3.966|
+    |TraesNOR2D03G01226140 | 13.032|      -0.156|     2.569|
+    |TraesNOR1A03G00156570 | 12.853|       0.319|     0.739|
+    |TraesNOR3D03G01932610 | 12.843|       0.123|    -0.905|
+    |TraesNOR2A03G00800550 | 12.505|      -0.783|     1.510|
+    |TraesNOR4D03G02551270 | 12.353|      -0.720|    -0.113|
+    |TraesNOR7D03G04390710 | 12.277|       0.648|    -1.622|
+    |TraesNOR7A03G03920620 | 12.238|      -0.351|     1.678|
+
+### Interpretation of the three metrics
+
+| d_full   | correlation  | amplitude | biological meaning                                       |
+|----------|--------------|-----------|----------------------------------------------------------|
+| low      | high         | ~0        | identical response shape and strength                    |
+| moderate | high         | ±large    | same response pattern, protein buffered or amplified     |
+| high     | high         | ±large    | similar pattern but large amplitude difference (unusual) |
+| high     | low/negative | any       | opposite or orthogonal regulation; genuine decoupling    |
+| high     | moderate     | any       | delayed/shifted response; kinetic lag                    |
 
 ------------------------------------------------------------------------
 
