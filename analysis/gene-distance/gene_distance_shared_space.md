@@ -497,9 +497,22 @@ and needs no ground truth.
 
 ``` r
 #' Build the shared space and full-space gene distances for one real variety.
+#' Enforces assumption A1 (1:1 gene<->protein correspondence) by checking that
+#' the protein matrix has already been collapsed to 1:1 identifiers.
 gene_distance_real <- function(v, n_perm = 199, seed = 1) {
 
   common <- intersect(rownames(v$qc_rna$vst), rownames(v$imputed$mixed))
+
+  # A1: Verify 1:1 correspondence
+  # In the simulation, this is enforced by explicit filtering in §4.
+  # For real data, we verify that row names are already clean 1:1 identifiers.
+  # If the protein matrix contains ambiguous groups or isoforms, they should have
+  # been collapsed/filtered upstream by prepare_variety() or equivalent.
+  stopifnot(
+    "Protein matrix must have unique row identifiers (assumption A1)" =
+      length(unique(rownames(v$imputed$mixed))) == nrow(v$imputed$mixed)
+  )
+
   R_cond <- cell_means(v$qc_rna$vst[common, , drop = FALSE],    v$meta)
   P_cond <- cell_means(v$imputed$mixed[common, , drop = FALSE], v$meta)
 
@@ -586,41 +599,113 @@ stability_check <- function(v, B = 60) {
   Rb <- boot_cell_means(v$qc_rna$vst[common, , drop = FALSE],    v$meta, B = B, seed = 11)
   Pb <- boot_cell_means(v$imputed$mixed[common, , drop = FALSE], v$meta, B = B, seed = 97)
 
+  # Calculate distance independently for each bootstrap replicate
   D <- vapply(seq_len(B), function(b) {
     sp <- build_shared_space(Rb[[b]][common, ], Pb[[b]][common, ])
     euclid(sp$Rs, sp$Ps)
   }, numeric(length(common)))
   rownames(D) <- common
 
-  half1 <- rowMeans(D[, 1:(B/2), drop = FALSE])
-  half2 <- rowMeans(D[, (B/2 + 1):B, drop = FALSE])
-  rank_cor <- cor(rank(half1), rank(half2), method = "spearman")
+  # For reference: calculate the original ranking
+  sp_orig <- build_shared_space(Rb[[1]][common, ], Pb[[1]][common, ])  # Use first bootstrap as baseline
+  d_orig <- euclid(sp_orig$Rs, sp_orig$Ps)
+  rank_orig <- rank(-d_orig)
 
-  top10_1 <- names(sort(half1, decreasing = TRUE))[seq_len(round(0.1 * length(common)))]
-  top10_2 <- names(sort(half2, decreasing = TRUE))[seq_len(round(0.1 * length(common)))]
-  overlap <- length(intersect(top10_1, top10_2)) / length(top10_1)
+  # Calculate Spearman correlation between original ranking and each bootstrap ranking
+  boot_rank_cors <- vapply(seq_len(B), function(b) {
+    rank_boot <- rank(-D[, b])
+    cor(rank_orig, rank_boot, method = "spearman")
+  }, numeric(1))
 
-  list(rank_cor = rank_cor, top10_overlap = overlap, n_genes = length(common), D = D)
+  # Report median and interval
+  rank_cor_median <- median(boot_rank_cors)
+  rank_cor_interval <- quantile(boot_rank_cors, c(0.05, 0.95))
+
+  # For top 10%, calculate how often each gene appears in that decile across bootstraps
+  top10_count <- round(0.1 * length(common))
+  top10_appearance <- sapply(seq_len(length(common)), function(i) {
+    sum(rank(-D[i, ]) <= top10_count) / B
+  })
+  names(top10_appearance) <- common
+
+  list(
+    rank_cor_median = rank_cor_median,
+    rank_cor_interval = rank_cor_interval,
+    top10_appearance = top10_appearance,
+    n_genes = length(common),
+    D = D,
+    boot_rank_cors = boot_rank_cors
+  )
 }
 
 STAB <- lapply(REAL, stability_check)
+
+# Summary table for G4
 g4 <- do.call(rbind, lapply(names(STAB), function(nm) data.frame(
-  variety = nm, n_genes = STAB[[nm]]$n_genes,
-  split_half_rank_cor = round(STAB[[nm]]$rank_cor, 3),
-  top10pct_overlap    = round(STAB[[nm]]$top10_overlap, 3)
+  variety = nm,
+  n_genes = STAB[[nm]]$n_genes,
+  median_spearman_rho = round(STAB[[nm]]$rank_cor_median, 3),
+  rho_5pct = round(STAB[[nm]]$rank_cor_interval[1], 3),
+  rho_95pct = round(STAB[[nm]]$rank_cor_interval[2], 3)
 )))
-knitr::kable(g4, caption = "G4: split-half reliability of the per-gene distance ranking across 60 independent RNA/protein replicate resamples. top10pct_overlap = fraction of the most-discordant decile that agrees between two independent halves of the bootstrap.")
+knitr::kable(g4, caption = "G4: Ranking stability across 60 bootstrap resamples of condition means. For each variety, shows median Spearman rank correlation between original ranking and each bootstrap, plus 5–95% interval. This tests whether a gene's rank is stable under replicate resampling (not whether bootstrapped averages have converged).")
 ```
 
-| variety | n_genes | split_half_rank_cor | top10pct_overlap |
-|:--------|--------:|--------------------:|-----------------:|
-| Cadenza |    5580 |               0.997 |            0.957 |
-| Norin   |    5159 |               0.997 |            0.967 |
+|     | variety | n_genes | median_spearman_rho | rho_5pct | rho_95pct |
+|:----|:--------|--------:|--------------------:|---------:|----------:|
+| 5%  | Cadenza |    5580 |               0.911 |    0.876 |     0.947 |
+| 5%1 | Norin   |    5159 |               0.896 |    0.853 |     0.942 |
 
-G4: split-half reliability of the per-gene distance ranking across 60
-independent RNA/protein replicate resamples. top10pct_overlap = fraction
-of the most-discordant decile that agrees between two independent halves
-of the bootstrap.
+G4: Ranking stability across 60 bootstrap resamples of condition means.
+For each variety, shows median Spearman rank correlation between
+original ranking and each bootstrap, plus 5–95% interval. This tests
+whether a gene’s rank is stable under replicate resampling (not whether
+bootstrapped averages have converged).
+
+``` r
+# For each variety, show which genes most consistently appear in the top 10%
+cat("Top 10% consistency across bootstraps:\n\n")
+```
+
+    Top 10% consistency across bootstraps:
+
+``` r
+for (nm in names(STAB)) {
+  top10_pct <- sort(STAB[[nm]]$top10_appearance, decreasing = TRUE)[1:10]
+  cat("**", nm, ":**\n", sep = "")
+  cat("Genes appearing in top 10% most-discordant in N% of 60 bootstrap resamples:\n")
+  for (i in seq_len(length(top10_pct))) {
+    cat(sprintf("  %s: %.0f%%\n", names(top10_pct)[i], top10_pct[i] * 100))
+  }
+  cat("\n")
+}
+```
+
+    **Cadenza:**
+    Genes appearing in top 10% most-discordant in N% of 60 bootstrap resamples:
+      TraesCAD_scaffold_000005_01G000100: 100%
+      TraesCAD_scaffold_000016_01G000300: 100%
+      TraesCAD_scaffold_000018_01G001700: 100%
+      TraesCAD_scaffold_000022_01G000100: 100%
+      TraesCAD_scaffold_000030_01G000100: 100%
+      TraesCAD_scaffold_000030_01G000400: 100%
+      TraesCAD_scaffold_000043_01G000600: 100%
+      TraesCAD_scaffold_000050_01G000700: 100%
+      TraesCAD_scaffold_000077_01G000100: 100%
+      TraesCAD_scaffold_000081_01G000100: 100%
+
+    **Norin:**
+    Genes appearing in top 10% most-discordant in N% of 60 bootstrap resamples:
+      TraesNOR1A03G00003900: 100%
+      TraesNOR1A03G00005050: 100%
+      TraesNOR1A03G00009760: 100%
+      TraesNOR1A03G00010740: 100%
+      TraesNOR1A03G00010780: 100%
+      TraesNOR1A03G00011550: 100%
+      TraesNOR1A03G00011890: 100%
+      TraesNOR1A03G00013400: 100%
+      TraesNOR1A03G00015580: 100%
+      TraesNOR1A03G00015590: 100%
 
 ------------------------------------------------------------------------
 
@@ -796,17 +881,18 @@ plot_shared_umap <- function(space_list, dist_df, variety_name, tag = "") {
 }
 
 #' Highlight top and bottom genes by distance
+#' Uses d_full (full space distance) for ranking consistency, but visualizes in UMAP space
 plot_top_genes_umap <- function(space_list, dist_df, variety_name, n_top = 10) {
 
   Er <- space_list$Er
   Ep <- space_list$Ep
-  distances <- dist_df$d_umap
+  distances <- dist_df$d_full  # Rank by full-space distance, visualize in UMAP
 
   par(mar = c(4, 4, 3, 1))
 
   # Background points in light gray
   plot(Er[, 1], Er[, 2], type = "n", xlab = "UMAP1", ylab = "UMAP2",
-       main = paste(variety_name, ": Top", n_top, "Most/Least Discordant Genes"),
+       main = paste(variety_name, ": Top", n_top, "Most/Least Discordant Genes\n(ranked by full-space distance, shown in UMAP)"),
        cex.main = 1.1)
 
   points(Er[, 1], Er[, 2], col = rgb(0.5, 0.5, 0.5, 0.2), pch = 19, cex = 1.5)
@@ -1158,36 +1244,43 @@ par(op)
 ### What the distance tells us
 
 The RNA-protein distance in the shared condition-profile space measures
-**how differently each gene’s RNA and protein respond across
-experimental conditions**, scaled and centred so that:
+**standardised discrepancy between the centred RNA and protein
+condition-response profiles**. Mathematically:
 
-- **Distance ≈ 0**: RNA and protein have nearly identical
-  condition-response shapes (e.g., both peak under heat stress, dip
-  under drought)
-- **Distance \> mean**: Divergent response patterns (e.g., RNA goes up
-  under drought, protein stays flat; or timing lag)
-- The distance is in **standardised (z-score) units**, making it
-  comparable across genes
+$$d_i = \sqrt{\sum_c (s_c x_{ic} - y_{ic})^2}$$
+
+where $s_c$ is the across-gene RNA SD for condition $c$, $x_{ic}$ is the
+centred RNA for gene $i$ and condition $c$, and $y_{ic}$ is centred
+protein.
+
+**Key properties:** - Row-centering removes absolute baseline abundance,
+but **does NOT remove response amplitude** - The metric includes both
+**pattern (direction of change)** and **magnitude (strength of
+response)** - Example: if RNA = (−1, 0, 1) and protein = (−2, 0, 2),
+they have identical pattern but the protein response is twice as strong,
+so distance \> 0 - If protein = (1, 0, −1), the direction is reversed;
+distance is large - The metric is **one-directional**: fitted on RNA,
+protein projected into that space
 
 ### Can we use it for “similarity”?
 
-**Yes, with caveats.** The distance ranks genes reproducibly (G4:
-split-half Spearman ρ = 0.997), and the pairing signal is real (G3:
-permutation p = 0.005). However:
+**Yes, but understand what it measures.** The distance ranks genes
+reproducibly (G4 median Spearman ρ across resamples), and the pairing
+signal is real (G3: permutation p = 0.005). However:
 
 1.  **It does NOT distinguish regulation from kinetics** (G1: `lag_only`
     genes rank as discordant despite being mechanistically concordant).
     A high-distance gene is equally likely to be slow-turnover as
     genuinely decoupled.
 
-2.  **It ranks by response-shape similarity alone**, not by absolute RNA
-    or protein level, absolute correlation, or fold-change agreement.
-    Two genes with identical shapes but opposite signs (one up, one
-    down) would have distance ≈ 0 because their *shapes* are concordant.
+2.  **It measures total discrepancy including amplitude**, not shape
+    alone. Two genes with identical pattern but different response
+    magnitudes will have non-zero distance. Two genes with opposite
+    directions (one peaks, one dips) will have large distance.
 
-3.  **The metric is one-directional**: we fit UMAP on RNA only, then
-    project protein into that space. Protein’s variance structure
-    doesn’t define the axes.
+3.  Better terminology: call this a **“standardised condition-response
+    discrepancy”** rather than “shape similarity”—it captures both
+    directional concordance and amplitude agreement.
 
 ### Full space vs PCA vs UMAP
 
