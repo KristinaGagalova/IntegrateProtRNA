@@ -41,7 +41,7 @@ See `dimensionality_reduction_wheat.qmd` §7c for that check. This document does
 ## Analysis outline
 
 | Step | What                                           | Why                                                       |
-|:-----|:-----------------------------------------------|:----------------------------------------------------------|
+|:-------------|:-------------------------|:-------------------------------|
 | §1   | Setup and data (real + simulated)              | Validate on known ground truth before touching real data  |
 | §2   | The method and its assumptions                 | Each with references                                      |
 | §3   | Implementation                                 | Shared-space construction, from scratch                   |
@@ -156,7 +156,7 @@ For each gene present in both layers:
 ### Assumptions, stated up front
 
 | \#  | Assumption                                                                               | Status                                                                      |
-|:----|:-----------------------------------------------------------------------------------------|:----------------------------------------------------------------------------|
+|:------------|:-------------------------------|:--------------------------|
 | A1  | The RNA\<-\>protein correspondence used is genuinely 1:1 for the genes scored            | Enforced by construction (see §4); ambiguous groups excluded                |
 | A2  | Condition means are the right granularity for a cross-block comparison                   | Carried over from D7, not re-derived here                                   |
 | A3  | Comparing row-centred *shape*, not absolute level, is the right notion of "look alike"   | Design choice, stated not tested                                            |
@@ -634,6 +634,29 @@ knitr::kable(TB_nor$most_concordant, row.names = FALSE,
             caption = "Norin: 15 genes with the smallest RNA<->protein condition-profile distance.")
 ```
 
+```{r}
+#| label: export-tables-8condition
+
+# Export full gene rankings (8-condition analysis)
+output_dir <- here::here("results", "gene-distance")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (nm in c("Cadenza", "Norin")) {
+  d <- GD[[nm]]$genes[order(-GD[[nm]]$genes$d_full), ]
+  filename <- file.path(output_dir, paste0(tolower(nm), "_gene_distances_8condition.csv"))
+  write.csv(d, filename, row.names = FALSE)
+  cat("✓ Saved:", filename, "\n")
+}
+
+cat("\nFiles contain columns:\n",
+    "  gene_id: gene identifier\n",
+    "  d_full: distance (full standardised space) — use this for ranking\n",
+    "  d_pca2: distance (top-2 PCA) — for comparison\n",
+    "  d_umap: distance (2D UMAP) — visualization only\n",
+    "  correlation: Spearman correlation (RNA vs protein response patterns)\n",
+    "  amplitude: log2(protein response magnitude / RNA response magnitude)\n")
+```
+
 ------------------------------------------------------------------------
 
 ## 8b. Three-metric decomposition: Distance, Correlation, Amplitude
@@ -669,7 +692,7 @@ for (nm in c("Cadenza", "Norin")) {
 ### Interpretation of the three metrics
 
 | d_full   | correlation  | amplitude | biological meaning                                       |
-|----------|--------------|-----------|----------------------------------------------------------|
+|------------|------------|------------|-------------------------------------|
 | low      | high         | \~0       | identical response shape and strength                    |
 | moderate | high         | ±large    | same response pattern, protein buffered or amplified     |
 | high     | high         | ±large    | similar pattern but large amplitude difference (unusual) |
@@ -740,6 +763,17 @@ if (!is.null(GD_contrast) && !all(sapply(GD_contrast, is.null))) {
   }
 
   par(op)
+
+  # Export infection-contrast results
+  output_dir <- here::here("results", "gene-distance")
+  for (nm in names(GD_contrast)) {
+    if (!is.null(GD_contrast[[nm]])) {
+      d <- GD_contrast[[nm]]$genes[order(-GD_contrast[[nm]]$genes$d_full), ]
+      filename <- file.path(output_dir, paste0(tolower(nm), "_gene_distances_infection_contrast.csv"))
+      write.csv(d, filename, row.names = FALSE)
+      cat("✓ Saved:", filename, "\n")
+    }
+  }
 }
 ```
 
@@ -1032,7 +1066,7 @@ where $s_c$ is the across-gene RNA SD for condition $c$, $x_{ic}$ is the centred
 From G2 and V4:
 
 | Space                 | Use for ranking?        | AUC (discordant vs baseline) | Notes                                                                                          |
-|-----------------------|-------------------------|------------------------------|------------------------------------------------------------------------------------------------|
+|-------------|-------------|-------------|---------------------------------|
 | **Full standardised** | ✅ Yes (A4 validated)   | 0.820                        | Most informative, distance preserved exactly                                                   |
 | **Top-2 PCA**         | ✅ Yes (nearly as good) | 0.827                        | Minimal loss of ranking power; visualisable as 2D plot                                         |
 | **2D UMAP**           | ⚠️ Use with caution     | 0.799                        | Designed for local structure, not global distances; loses \~2% AUC but more intuitive visually |

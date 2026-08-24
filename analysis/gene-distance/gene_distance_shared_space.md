@@ -21,6 +21,8 @@ Kristina Gagalova
   Amplitude](#b.-three-metric-decomposition-distance-correlation-amplitude)
   - [Interpretation of the three
     metrics](#interpretation-of-the-three-metrics)
+- [8c. Infection-response contrast analysis
+  (optional)](#c.-infection-response-contrast-analysis-optional)
 - [9. Visualizations: UMAP in shared
   space](#visualizations-umap-in-shared-space)
   - [V1 — Shared UMAP embeddings, real
@@ -602,6 +604,63 @@ gene_distance_real <- function(v, n_perm = 199, seed = 1) {
 }
 
 GD <- setNames(Map(function(v, s) gene_distance_real(v, seed = s), REAL, seq_along(REAL)), names(REAL))
+
+#' Infection-response contrast analysis: compare Infected - Control at each timepoint
+#' Instead of 8 condition means, use 4-point infection-response trajectories
+gene_distance_infection_contrast <- function(v, n_perm = 199, seed = 1) {
+  # Extract infection and control means for each timepoint
+  # v$meta should have: condition, treatment (infected/control), timepoint
+
+  common <- intersect(rownames(v$qc_rna$vst), rownames(v$imputed$mixed))
+
+  # Verify 1:1 mapping
+  stopifnot(
+    "Protein matrix must have unique row identifiers (assumption A1)" =
+      length(unique(rownames(v$imputed$mixed))) == nrow(v$imputed$mixed)
+  )
+
+  # Calculate contrasts for RNA and protein
+  R_contrast <- infection_contrasts(v$qc_rna$vst[common, ], v$meta)
+  P_contrast <- infection_contrasts(v$imputed$mixed[common, ], v$meta)
+
+  # If contrasts are empty or don't match, return NULL (metadata may not have treatment column)
+  if (nrow(R_contrast) == 0 || nrow(P_contrast) == 0 || ncol(R_contrast) != ncol(P_contrast)) {
+    return(NULL)
+  }
+
+  # Build shared space on contrasts
+  sp <- build_shared_space(R_contrast, P_contrast)
+  d_full <- euclid(sp$Rs, sp$Ps)
+  metrics <- gene_metrics(sp$Rs, sp$Ps)
+
+  # UMAP
+  nn <- max(2, min(15, nrow(sp$Rs) %/% 4))
+  set.seed(seed)
+  umap_fit <- uwot::umap(sp$Rs, n_neighbors = nn, min_dist = 0.10, n_components = 2,
+                         metric = "euclidean", ret_model = TRUE)
+  Er <- umap_fit$embedding
+  Ep <- uwot::umap_transform(sp$Ps, umap_fit)
+  d_umap <- sqrt(rowSums((Er - Ep)^2))
+
+  set.seed(seed)
+  null <- replicate(n_perm, mean(euclid(sp$Rs, sp$Ps[sample(nrow(sp$Ps)), , drop = FALSE])))
+  obs <- mean(d_full)
+  p_perm <- (sum(null <= obs) + 1) / (n_perm + 1)
+
+  list(genes = data.frame(gene_id = common,
+                          d_full = d_full,
+                          d_umap = d_umap,
+                          correlation = metrics$correlation,
+                          amplitude = metrics$amplitude),
+       space = list(Er = Er, Ep = Ep),
+       obs = obs, null = null, p_perm = p_perm, n_genes = length(common))
+}
+
+# Try to compute infection-contrast version (may be NULL if metadata lacks treatment info)
+GD_contrast <- tryCatch(
+  setNames(Map(function(v, s) gene_distance_infection_contrast(v, seed = s), REAL, seq_along(REAL)), names(REAL)),
+  error = function(e) NULL
+)
 ```
 
 ``` r
@@ -886,6 +945,41 @@ knitr::kable(TB_nor$most_concordant, row.names = FALSE,
 Norin: 15 genes with the smallest RNA\<-\>protein condition-profile
 distance.
 
+``` r
+# Export full gene rankings (8-condition analysis)
+output_dir <- here::here("results", "gene-distance")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (nm in c("Cadenza", "Norin")) {
+  d <- GD[[nm]]$genes[order(-GD[[nm]]$genes$d_full), ]
+  filename <- file.path(output_dir, paste0(tolower(nm), "_gene_distances_8condition.csv"))
+  write.csv(d, filename, row.names = FALSE)
+  cat("✓ Saved:", filename, "\n")
+}
+```
+
+    ✓ Saved: C:/Claude/Projects/IntegrateProtRNA/results/gene-distance/cadenza_gene_distances_8condition.csv 
+    ✓ Saved: C:/Claude/Projects/IntegrateProtRNA/results/gene-distance/norin_gene_distances_8condition.csv 
+
+``` r
+cat("\nFiles contain columns:\n",
+    "  gene_id: gene identifier\n",
+    "  d_full: distance (full standardised space) — use this for ranking\n",
+    "  d_pca2: distance (top-2 PCA) — for comparison\n",
+    "  d_umap: distance (2D UMAP) — visualization only\n",
+    "  correlation: Spearman correlation (RNA vs protein response patterns)\n",
+    "  amplitude: log2(protein response magnitude / RNA response magnitude)\n")
+```
+
+
+    Files contain columns:
+       gene_id: gene identifier
+       d_full: distance (full standardised space) — use this for ranking
+       d_pca2: distance (top-2 PCA) — for comparison
+       d_umap: distance (2D UMAP) — visualization only
+       correlation: Spearman correlation (RNA vs protein response patterns)
+       amplitude: log2(protein response magnitude / RNA response magnitude)
+
 ------------------------------------------------------------------------
 
 ## 8b. Three-metric decomposition: Distance, Correlation, Amplitude
@@ -969,6 +1063,84 @@ for (nm in c("Cadenza", "Norin")) {
 | high     | high         | ±large    | similar pattern but large amplitude difference (unusual) |
 | high     | low/negative | any       | opposite or orthogonal regulation; genuine decoupling    |
 | high     | moderate     | any       | delayed/shifted response; kinetic lag                    |
+
+------------------------------------------------------------------------
+
+## 8c. Infection-response contrast analysis (optional)
+
+The main analysis (§8) uses all 8 condition means (2 treatments × 4
+timepoints). But for the disease biology, a cleaner question is:
+
+**Does protein reproduce the infection-induced change observed at the
+transcript level?**
+
+This version uses only the 4-point infection-response trajectories:
+
+$$\Delta_t^{\text{RNA}} = \text{RNA}_{\text{infected}}(t) - \text{RNA}_{\text{control}}(t)$$
+$$\Delta_t^{\text{protein}} = \text{Protein}_{\text{infected}}(t) - \text{Protein}_{\text{control}}(t)$$
+
+This avoids conflating normal developmental time-effects with
+infection-specific effects.
+
+``` r
+if (!is.null(GD_contrast) && !all(sapply(GD_contrast, is.null))) {
+  cat("✓ Infection-response contrast analysis computed.\n\n")
+  for (nm in names(GD_contrast)) {
+    if (!is.null(GD_contrast[[nm]])) {
+      cat("**", nm, ":**\n", sep = "")
+      d <- GD_contrast[[nm]]$genes
+      cat("  Genes:", nrow(d), "\n")
+      cat("  Mean distance (contrasts):", round(GD_contrast[[nm]]$obs, 3), "\n")
+      cat("  Permutation p:", GD_contrast[[nm]]$p_perm, "\n\n")
+    }
+  }
+} else {
+  cat("⚠️ Infection-response contrast analysis not available.\n",
+      "Metadata may not have 'treatment' column (infected vs control).\n")
+}
+```
+
+    ⚠️ Infection-response contrast analysis not available.
+     Metadata may not have 'treatment' column (infected vs control).
+
+``` r
+if (!is.null(GD_contrast) && !all(sapply(GD_contrast, is.null))) {
+  op <- par(mfrow = c(1, 2))
+
+  for (nm in names(GD_contrast)) {
+    if (!is.null(GD_contrast[[nm]])) {
+      d_main <- GD[[nm]]$genes
+      d_contrast <- GD_contrast[[nm]]$genes
+
+      # Merge on gene_id
+      merged <- merge(d_main[, c("gene_id", "d_full")],
+                      d_contrast[, c("gene_id", "d_full")],
+                      by = "gene_id", suffixes = c("_main", "_contrast"))
+
+      r_rank <- cor(rank(-merged$d_full_main), rank(-merged$d_full_contrast), method = "spearman")
+
+      plot(merged$d_full_main, merged$d_full_contrast, pch = 19, col = "#2E86AB", alpha = 0.5,
+           main = paste(nm, "\nSpearman ρ =", round(r_rank, 3)),
+           xlab = "Distance (8 conditions)", ylab = "Distance (4 infection contrasts)")
+      abline(0, 1, col = "gray", lty = 2, lwd = 1)
+      abline(lm(merged$d_full_contrast ~ merged$d_full_main), col = "#D1495B", lwd = 2)
+    }
+  }
+
+  par(op)
+
+  # Export infection-contrast results
+  output_dir <- here::here("results", "gene-distance")
+  for (nm in names(GD_contrast)) {
+    if (!is.null(GD_contrast[[nm]])) {
+      d <- GD_contrast[[nm]]$genes[order(-GD_contrast[[nm]]$genes$d_full), ]
+      filename <- file.path(output_dir, paste0(tolower(nm), "_gene_distances_infection_contrast.csv"))
+      write.csv(d, filename, row.names = FALSE)
+      cat("✓ Saved:", filename, "\n")
+    }
+  }
+}
+```
 
 ------------------------------------------------------------------------
 
