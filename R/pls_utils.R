@@ -108,3 +108,97 @@ align_sign <- function(m, ref) {
   s <- sign(colSums(m * ref)); s[s == 0] <- 1
   sweep(m, 2, s, "*")
 }
+
+## Permutation-null p-value for each component's leave-one-cell-out Q2.
+##
+## Q2 alone cannot be trusted as "validated" at face value here: with as few
+## as 8 design-cell pseudo-samples, q2_loo() can still look deceptively good
+## by chance for a component with no real cross-block signal (the same reason
+## 06_integration_caseB.R and dimensionality_reduction_wheat.qmd's D7 both
+## build a permutation null for Q2 rather than reading it directly). This is
+## that check, factored out so any PLS-derived per-gene statistic -- not just
+## the ones in 06_integration_caseB.R -- can be gated on it before use.
+q2_perm_pvalue <- function(Xc, Yc, ncomp, nperm = 300, seed = 1) {
+  set.seed(seed)
+  Ax <- row_space(Xc); Ay <- row_space(Yc)
+  Kq <- min(ncomp, nrow(Ax) - 3)
+  q2_obs <- q2_loo(Ax, Ay, Kq)
+  perm_q2 <- matrix(NA_real_, nperm, Kq)
+  for (b in seq_len(nperm)) {
+    o <- sample(nrow(Ay))
+    perm_q2[b, ] <- q2_loo(Ax, Ay[o, , drop = FALSE], Kq)
+  }
+  p <- vapply(seq_len(Kq), function(k)
+    (1 + sum(perm_q2[, k] >= q2_obs[k])) / (nperm + 1), 0)
+  data.frame(component = seq_len(Kq), Q2 = round(q2_obs, 4),
+            Q2_perm_q95 = round(apply(perm_q2, 2, quantile, .95), 4),
+            p_Q2 = signif(p, 3))
+}
+
+## Replicate-resampling bootstrap of PLS LOADINGS (not just scores).
+##
+## 06_integration_caseB.R's replicate bootstrap (its step 2) already resamples
+## replicates within each design cell, rebuilds cell means, and refits -- but
+## it only tracks the bootstrap distribution of SCORES (t, u), for component
+## trajectory CIs. It does not track LOADINGS (w, c), so no per-gene stability
+## statistic has existed anywhere in this project until now.
+##
+## This matters because dimensionality_reduction_wheat.qmd's D7 established,
+## on the real wheat data, which resampling scheme is trustworthy: condition-
+## mean aggregation with THIS replicate-within-cell resampling (Q2 = 0.309,
+## p = 0.015 for Cadenza) versus a FIXED individual-replicate pairing (an
+## unrepeatable, apparently cherry-picked draw -- see enrichment_wheat.qmd
+## E4 discussion) versus a fully randomised cross-block replicate pairing
+## (decisively negative, does not beat its own null). Bootstrapping loadings
+## under the FIRST scheme is therefore the one way to get a per-gene PLS
+## statistic that inherits a validated resampling procedure rather than an
+## invalidated one.
+##
+## Returns, for each feature in each block, the bootstrap mean loading and a
+## STABILITY score = the fraction of bootstrap draws whose loading sign
+## agrees with the point estimate's sign (1 = always agrees, 0.5 = coin flip).
+## A gene with a large point-estimate loading but low stability is exactly
+## the failure mode this guards against: at n = 8 pseudo-samples one gene's
+## loading can be large by chance, and only resampling reveals that.
+pls_boot_loadings <- function(rna_mat, prot_mat, cd_r, cd_p, cells, hv_r, hv_p,
+                              ncomp, B = 200, seed = 1) {
+  set.seed(seed)
+  idx_r <- lapply(cells, function(cl) which(cd_r$cell == cl))
+  idx_p <- lapply(cells, function(cl) which(cd_p$cell == cl))
+
+  Xc <- prep_block(cell_means(rna_mat[hv_r, , drop = FALSE],  cd_r))
+  Yc <- prep_block(cell_means(prot_mat[hv_p, , drop = FALSE], cd_p))
+  stopifnot(identical(rownames(Xc), rownames(Yc)))
+  fit <- pls2(Xc, Yc, ncomp = ncomp)
+
+  boot_w <- array(NA_real_, c(length(hv_r), ncomp, B))
+  boot_c <- array(NA_real_, c(length(hv_p), ncomp, B))
+  for (b in seq_len(B)) {
+    ir <- unlist(lapply(idx_r, function(ii) sample(ii, length(ii), TRUE)))
+    ip <- unlist(lapply(idx_p, function(ii) sample(ii, length(ii), TRUE)))
+    Xb <- prep_block(cell_means(rna_mat[hv_r, ir, drop = FALSE],  cd_r[ir, ]))
+    Yb <- prep_block(cell_means(prot_mat[hv_p, ip, drop = FALSE], cd_p[ip, ]))
+    fb <- pls2(Xb, Yb, ncomp = ncomp)
+    boot_w[, , b] <- align_sign(fb$w, fit$w)
+    boot_c[, , b] <- align_sign(fb$c, fit$c)
+  }
+
+  summarise_block <- function(point, boot, feat_names) {
+    do.call(rbind, lapply(seq_len(ncomp), function(k) {
+      bk <- boot[, k, ]                      # features x B
+      pt_sign <- sign(point[, k]); pt_sign[pt_sign == 0] <- 1
+      stability <- rowMeans(sign(bk) == pt_sign, na.rm = TRUE)
+      data.frame(feature = feat_names, component = k,
+                loading = point[, k],
+                boot_mean = rowMeans(bk, na.rm = TRUE),
+                boot_sd = apply(bk, 1, sd, na.rm = TRUE),
+                stability = stability)
+    }))
+  }
+
+  list(
+    rna     = summarise_block(fit$w, boot_w, hv_r),
+    protein = summarise_block(fit$c, boot_c, hv_p),
+    fit     = fit
+  )
+}

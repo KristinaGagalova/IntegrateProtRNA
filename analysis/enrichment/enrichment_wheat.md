@@ -17,12 +17,28 @@ Kristina Gagalova
   on](#load-the-integration-statistics-to-rank-on)
 - [4. E1 – Discordance GSEA: which bins go out of RNA/protein
   sync?](#e1-discordance-gsea-which-bins-go-out-of-rnaprotein-sync)
+  - [Result (first successful render,
+    2026-08-25)](#result-first-successful-render-2026-08-25)
 - [5. E2 – Three-metric decomposition: distance, correlation,
   amplitude](#e2-three-metric-decomposition-distance-correlation-amplitude)
+  - [Result (first successful render, 2026-08-25) – and a bug in the
+    `log2_amplitude` step
+    above](#result-first-successful-render-2026-08-25-and-a-bug-in-the-log2_amplitude-step-above)
 - [6. E3 – Cross-variety differential
   enrichment](#e3-cross-variety-differential-enrichment)
+  - [Result (first successful render, 2026-08-25) – read the top-20
+    table with padj in
+    view](#result-first-successful-render-2026-08-25-read-the-top-20-table-with-padj-in-view)
+- [6b. E4 – An ML-derived per-gene ranking: PLS component-1 loading
+  (Cadenza
+  only)](#b.-e4-an-ml-derived-per-gene-ranking-pls-component-1-loading-cadenza-only)
+  - [Result – a clean, biologically coherent signal, and it is not just
+    re-deriving
+    E1](#result-a-clean-biologically-coherent-signal-and-it-is-not-just-re-deriving-e1)
 - [7. Not yet wired up here](#not-yet-wired-up-here)
 - [8. Outputs](#outputs)
+- [9. Summary and known issues (first successful render,
+  2026-08-25)](#summary-and-known-issues-first-successful-render-2026-08-25)
 
 ## Purpose and scope
 
@@ -577,6 +593,16 @@ if (length(e1_plots) > 0) Reduce(`|`, e1_plots)
 <img src="enrichment_wheat_files/figure-commonmark/e1-bubble-1.png"
 data-fig-align="center" />
 
+### Result (first successful render, 2026-08-25)
+
+Of the 5,159 / 5,580 ranked genes, only **2,329 / 2,553** actually fall
+in a qualifying MapMan bin (5–500 genes) – the rest are `non.annotated`
+or land in bins outside that size range, so that smaller number is the
+effective sample size for this test. **168 / 174** bins were tested;
+**13 / 12** survive `padj < 0.05`. That is a modest but real signal:
+about 7–8% of tested bins show significant discordance enrichment, well
+above the 5% expected under the null.
+
 ------------------------------------------------------------------------
 
 ## 5. E2 – Three-metric decomposition: distance, correlation, amplitude
@@ -960,6 +986,42 @@ if (length(e2_plots_flat) > 0) Reduce(`|`, e2_plots_flat)
 <img src="enrichment_wheat_files/figure-commonmark/e2-bubble-1.png"
 data-fig-align="center" />
 
+### Result (first successful render, 2026-08-25) – and a bug in the `log2_amplitude` step above
+
+`correlation` GSEA is clean: 2 / 5 bins pass `padj < 0.05` (Norin /
+Cadenza), on the full 2,329 / 2,553-gene ranking.
+
+`log2_amplitude` is **not** clean, and the cause is a bug in the chunk
+above, not a biological null result.
+`analysis/gene-distance/gene_distance_shared_space.qmd` (its own line
+657) documents that the `amplitude` column saved to
+`results/gene-distance/*_gene_distances_8condition.csv` is **already**
+`log2(protein response magnitude / RNA response magnitude)` – signed,
+centred at 0. The comment above this chunk describes it instead as a raw
+positive ratio needing a first `log2()`, and applies one. In the actual
+data, `amplitude` is negative for roughly 60% of genes (3,115 / 5,159
+Norin, 3,169 / 5,580 Cadenza; min about –3.65 / –4.55) – so
+`log2(d$amplitude)` takes the log of a negative number for most genes,
+which is `NaN` (visible as the two `NaNs produced` warnings on render),
+silently dropped by `ranks[is.finite(ranks)]` inside
+`run_fgsea_on_stat()`.
+
+Net effect: the `log2_amplitude` GSEA ran on only **904 / 1,118** genes
+instead of the ~2,300–2,500 the other two statistics use, and **0 bins**
+survive `padj < 0.05` in either variety. That zero is an artefact of the
+halved, biased sample (whichever genes happened to have positive
+`amplitude` survive; the rest are discarded), not evidence that
+amplitude-driven discordance has no functional structure.
+
+**Not fixed in this pass, since a fix changes results and a re-render
+was asked to wait.** The fix, when applied: drop the second `log2()` in
+the chunk above and rank on `amplitude` directly (still
+`scoreType = "std"`, since it is already signed) – e.g. replace
+`d$log2_amplitude <- log2(d$amplitude)` with
+`d$log2_amplitude <- d$amplitude` (kept the same column name so the rest
+of the chunk/plots need no other change), or rename throughout for
+clarity.
+
 ------------------------------------------------------------------------
 
 ## 6. E3 – Cross-variety differential enrichment
@@ -1082,6 +1144,350 @@ if (nrow(e3_top) > 0) {
 <img src="enrichment_wheat_files/figure-commonmark/e3-plot-1.png"
 data-fig-align="center" />
 
+### Result (first successful render, 2026-08-25) – read the top-20 table with padj in view
+
+The join covers 105,305 Norin\<-\>Cadenza RBH pairs. The top 20 bins by
+`|delta_NES|` (`TCA / org transformation...malic`,
+`lipid metabolism...beta-oxidation`, `RNA.processing.RNA helicase`,
+etc.) are ranked on the raw NES gap **without conditioning on
+significance in either variety** – most rows in that table have
+`padj_norin` or `padj_cadenza` at or near 1.0 (e.g. row 1:
+`padj_norin = 1.00`, `padj_cadenza = 0.58`; row 5: both `padj = 1.00`).
+So this table currently answers “biggest raw NES gap,” not “biggest
+*credible* gap” – a bin can top it purely from sampling noise in one
+variety’s ranking. Tightening this to
+`filter(padj_norin < 0.05 | padj_cadenza < 0.05)` before `slice_max()`
+would restrict the comparison to bins that are actually significant in
+at least one variety, which is the comparison the section’s framing
+(“which functional categories are discordant in one variety but not the
+other”) implies. Not applied here for the same reason as the E2 note
+above – flagged, not fixed, pending a deliberate re-render.
+
+------------------------------------------------------------------------
+
+## 6b. E4 – An ML-derived per-gene ranking: PLS component-1 loading (Cadenza only)
+
+Everything above ranks genes by kinetics or shared-space distance.
+Whether an ML method (PLS/PCA/autoencoder) could *also* contribute an
+individual-gene ranking was checked directly rather than assumed,
+because the obvious way to get one from these methods – a point-estimate
+PLS/AE loading – is exactly the failure mode already found in the
+reference PLS notebook
+(`norinXcadenza-shared/analysis/integrated/latent-space-projection/PLS-integration.qmd`):
+it fabricates a 1:1 RNA\<-\>protein sample correspondence via
+`sample_cond` label matching, which `dimensionality_reduction_wheat.qmd`
+§7b (D7) already quantified as an unrepeatable, apparently favourable
+draw (`fixed_pairing_pctile_of_random_pairings = 1.00` in **both**
+varieties) rather than real signal.
+
+D7 also identified the scheme that *is* trustworthy: condition-mean PLS,
+with individual replicates entering only through **randomised
+within-cell resampling** (the same mechanism `R/06_integration_caseB.R`
+§2 already uses for component-trajectory bootstrap CIs). What was
+missing is a per-**gene** version of that same resampling – 06’s
+bootstrap tracks score stability, not loading stability.
+`pls_boot_loadings()` (added to `R/pls_utils.R`) closes that gap: it
+refits the condition-mean PLS over many within-cell replicate resamples
+and reports, per gene, the fraction of resamples whose loading sign
+agrees with the point estimate – a stability score in the same spirit as
+`pairing_stability_selection.tsv`, but built on the resampling scheme D7
+validated rather than the one it refuted.
+
+Two more restrictions follow directly from the last conversation’s
+audit, not from this section’s own results:
+
+- **Cadenza only.** D7 found no validated aggregate coupling for Norin
+  (condition-mean PLS `p_Q2 = 0.060`, missing even a lenient threshold)
+  – there is no validated axis to rank Norin genes against.
+- **Component 1 only**, decided by `q2_perm_pvalue()` below *before*
+  looking at any gene-level output, per the pre-registration discipline
+  the rest of this project follows.
+
+``` r
+need_pkgs(c("edgeR", "DESeq2", "matrixStats", "impute", "limma"))
+source(here::here("R", "wheat_pipeline.R"))
+source(here::here("R", "pls_utils.R"))
+
+DESIGN <- wheat_design()
+cad_prep <- prepare_variety("cadenza", DESIGN)
+```
+
+    Cluster size 5861 broken into 3622 2239 
+    Cluster size 3622 broken into 2430 1192 
+    Cluster size 2430 broken into 1561 869 
+    Cluster size 1561 broken into 819 742 
+    Done cluster 819 
+    Done cluster 742 
+    Done cluster 1561 
+    Done cluster 869 
+    Done cluster 2430 
+    Done cluster 1192 
+    Done cluster 3622 
+    Cluster size 2239 broken into 1075 1164 
+    Done cluster 1075 
+    Done cluster 1164 
+    Done cluster 2239 
+
+``` r
+cd_r_e4 <- cad_prep$meta[colnames(cad_prep$qc_rna$vst), , drop = FALSE]
+cd_p_e4 <- cad_prep$meta[colnames(cad_prep$imputed$mixed), , drop = FALSE]
+cells_e4 <- levels(cad_prep$meta$cell)
+
+cat("RNA genes after QC:            ", nrow(cad_prep$qc_rna$vst), "\n")
+```
+
+    RNA genes after QC:             59931 
+
+``` r
+cat("Protein genes after QC+impute: ", nrow(cad_prep$imputed$mixed), "\n")
+```
+
+    Protein genes after QC+impute:  5861 
+
+``` r
+n_hvg_e4 <- min(2000, nrow(cad_prep$qc_rna$vst))
+hv_r_e4  <- top_variable(cad_prep$qc_rna$vst, n_hvg_e4)
+hv_p_e4  <- rownames(cad_prep$imputed$mixed)   # already small (~5-6k) -- use all
+
+Xc_e4 <- prep_block(cell_means(cad_prep$qc_rna$vst[hv_r_e4, ],   cd_r_e4))
+Yc_e4 <- prep_block(cell_means(cad_prep$imputed$mixed[hv_p_e4, ], cd_p_e4))
+stopifnot(identical(rownames(Xc_e4), rownames(Yc_e4)))
+
+## Which components carry validated, out-of-sample predictive signal, BEFORE
+## any gene loading is examined -- the same discipline as D7/06's own p_Q2.
+q2p_e4 <- q2_perm_pvalue(Xc_e4, Yc_e4, ncomp = 3, nperm = 300, seed = 20260825)
+q2p_e4
+```
+
+      component     Q2 Q2_perm_q95    p_Q2
+    1         1 0.2463      0.0614 0.01330
+    2         2 0.1748      0.0638 0.00997
+    3         3 0.1181     -0.1332 0.00332
+
+**Reading the component table.** Component 1 alone is both the strongest
+(Q² = 0.246 vs. a permutation-null 95th percentile of 0.061) and,
+notably, cumulative Q² *falls* as components 2 and 3 are added (0.175,
+then 0.118) even though each cumulative Q² still nominally clears its
+own (increasingly negative) null. That pattern – more components making
+held-out prediction worse – is the signature of components 2/3 adding
+noise rather than additional shared signal, not evidence they should be
+included. **Component 1 only is used below.**
+
+``` r
+e4_boot <- pls_boot_loadings(cad_prep$qc_rna$vst, cad_prep$imputed$mixed,
+                             cd_r_e4, cd_p_e4, cells_e4,
+                             hv_r_e4, hv_p_e4, ncomp = 1, B = 200, seed = 20260825)
+
+e4_prot <- e4_boot$protein
+e4_prot$gene_id <- strip_isoform(e4_prot$feature)
+
+cat("Loading summary (component 1):\n"); print(summary(e4_prot$loading))
+```
+
+    Loading summary (component 1):
+
+          Min.    1st Qu.     Median       Mean    3rd Qu.       Max. 
+    -0.0343532 -0.0035914  0.0008162  0.0031317  0.0063711  0.1065490 
+
+``` r
+cat("Stability summary (fraction of 200 bootstrap draws agreeing in sign):\n")
+```
+
+    Stability summary (fraction of 200 bootstrap draws agreeing in sign):
+
+``` r
+print(summary(e4_prot$stability))
+```
+
+       Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+     0.4400  0.8900  1.0000  0.9196  1.0000  1.0000 
+
+``` r
+cat("Top-100 |loading| genes with stability >= 0.9:",
+   sum(rank(-abs(e4_prot$loading)) <= 100 & e4_prot$stability >= 0.9), "/ 100\n")
+```
+
+    Top-100 |loading| genes with stability >= 0.9: 100 / 100
+
+``` r
+cat("Top-100 |loading| genes with stability <  0.5 (would-be false leads):",
+   sum(rank(-abs(e4_prot$loading)) <= 100 & e4_prot$stability <  0.5), "/ 100\n")
+```
+
+    Top-100 |loading| genes with stability <  0.5 (would-be false leads): 0 / 100
+
+``` r
+## Reuses the SAME Cadenza MapMan gene sets as E1/E2 -- no new pathway-
+## building code, and it makes the E1/E4 hit lists directly comparable.
+## No Norin arm: D7 found no validated component to rank Norin genes against.
+e4_prot$loading_c1 <- e4_prot$loading
+e4_cadenza <- run_fgsea_on_stat(e4_prot, "loading_c1", e1_mapman_pathways$cadenza,
+                                score_type = "std")
+```
+
+    ranked loading_c1 x gene sets                    2694 ids overlap
+
+      |                                                                            
+      |                                                                      |   0%
+      |                                                                            
+      |===                                                                   |   4%
+      |                                                                            
+      |=====                                                                 |   7%
+      |                                                                            
+      |========                                                              |  11%
+      |                                                                            
+      |==========                                                            |  15%
+      |                                                                            
+      |=============                                                         |  19%
+      |                                                                            
+      |================                                                      |  22%
+      |                                                                            
+      |==================                                                    |  26%
+      |                                                                            
+      |=====================                                                 |  30%
+      |                                                                            
+      |=======================                                               |  33%
+      |                                                                            
+      |==========================                                            |  37%
+      |                                                                            
+      |=============================                                         |  41%
+      |                                                                            
+      |===============================                                       |  44%
+      |                                                                            
+      |==================================                                    |  48%
+      |                                                                            
+      |====================================                                  |  52%
+      |                                                                            
+      |=======================================                               |  56%
+      |                                                                            
+      |=========================================                             |  59%
+      |                                                                            
+      |============================================                          |  63%
+      |                                                                            
+      |===============================================                       |  67%
+      |                                                                            
+      |=================================================                     |  70%
+      |                                                                            
+      |====================================================                  |  74%
+      |                                                                            
+      |======================================================                |  78%
+      |                                                                            
+      |=========================================================             |  81%
+      |                                                                            
+      |============================================================          |  85%
+      |                                                                            
+      |==============================================================        |  89%
+      |                                                                            
+      |=================================================================     |  93%
+      |                                                                            
+      |===================================================================   |  96%
+      |                                                                            
+      |======================================================================| 100%
+
+``` r
+cat("MapMan bins tested:", nrow(e4_cadenza), "| padj < 0.05:",
+   sum(e4_cadenza$padj < 0.05, na.rm = TRUE), "\n")
+```
+
+    MapMan bins tested: 180 | padj < 0.05: 19 
+
+``` r
+plot_fgsea_bubble(e4_cadenza, top_n = 20,
+                  plot_title = "Cadenza: PLS component-1 loading (validated axis)")
+```
+
+
+    ==============================
+
+    Plot: Cadenza: PLS component-1 loading (validated axis)
+
+    Initial fgsea rows: 180
+
+    Columns: pathway, pval, padj, log2err, ES, NES, size, leadingEdge
+
+    Rows before padj filter: 180
+
+    padj cutoff: 0.05
+
+    Rows passing padj cutoff: 19
+
+    padj summary:
+
+       Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+     0.0000  0.4029  0.6078  0.5865  0.8661  1.0000 
+
+    Rows after top_n filter: 19
+
+    Building plot now.
+
+<img src="enrichment_wheat_files/figure-commonmark/e4-bubble-1.png"
+data-fig-align="center" />
+
+### Result – a clean, biologically coherent signal, and it is not just re-deriving E1
+
+19–20 / 180 testable bins pass `padj < 0.05` (~11%, versus E1’s 12/174 ≈
+7%) – `fgseaMultilevel`’s Monte Carlo p-value estimate moves one
+borderline bin across the 0.05 line from one run to the next (seeded,
+but not bit-identical across R sessions), so treat the count as ~19–20,
+not a fixed number. The top hit by a wide margin, stable across runs, is
+**`stress.biotic`** (NES = 2.15, padj ≈ 5e-11, size = 58) – the dominant
+validated shared RNA/protein axis over this infection time-course is,
+unsurprisingly and reassuringly, the biotic-stress response. The full
+positive side reads as a coherent defence program: peroxidases,
+beta-1,3-glucanases (classic PR-protein defence enzymes),
+phenylpropanoid/lignin biosynthesis (cell-wall reinforcement),
+glutathione S-transferases, cytochrome P450s and UDP-glucosyl/glucoronyl
+transferases (xenobiotic/defence detoxification), ABC transporters. The
+negative side is the mirror image – photosynthesis and light signalling
+turned down: PSII polypeptide subunits, NADH DH, `signalling.light`, PIP
+aquaporins, magnesium chelatase (chlorophyll synthesis). That defence-up
+/ photosynthesis-down pattern is exactly what a validated shared axis
+over an infection course should look like, which is a meaningful sanity
+check on the whole E4 approach, independent of any annotation-level
+argument.
+
+**Comparison with E1:** only 6 of these bins (`stress.biotic`,
+`stress.abiotic`, `misc.peroxidases`, the beta-1,3-glucanase bin, the
+PAL lignin bin, and the UDP-glucosyl/glucoronyl transferase bin) were
+also significant in E1’s `d_full`-ranked discordance test – **the other
+~13 are new**, not a re-statement of the distance-based result. That is
+the concrete answer to “what more can we use
+`dimensionality_reduction`’s ML approach for”: a validated PLS component
+contributes gene-set-level information that shape/scale discordance
+(E1/E2) does not surface on its own, precisely because it is picking up
+the dominant *direction* of coordinated cross-omics variation (infection
+response) rather than per-gene disagreement between the two layers.
+
+**Why this is trustworthy where the reference notebook’s version was
+not:** every ingredient here was checked before being used, not assumed
+– `p_Q2 = 0.013` for the component itself (not raw Q², which D7/06
+showed is gameable at n = 8), Cadenza-only (Norin has no validated
+axis), component 1 only (2/3 add noise, not signal), and the loading
+itself is bootstrap-stabilised under the resampling scheme D7 validated
+(100/100 of the top-100 \|loading\| genes have stability \>= 0.9; zero
+have stability \< 0.5). None of that machinery existed before this
+conversation; all of it is now in `R/pls_utils.R` (`q2_perm_pvalue()`,
+`pls_boot_loadings()`) for reuse.
+
+``` r
+## save_fgsea() is defined in §8 below, not yet in scope here -- inlined
+## rather than forward-referenced, since chunks execute top to bottom.
+save_fgsea_e4 <- function(res, path) {
+  df <- as.data.frame(res)
+  df[] <- lapply(df, function(x) if (is.list(x)) sapply(x, paste, collapse = ";") else x)
+  write.table(df, path, sep = "\t", row.names = FALSE, quote = FALSE)
+}
+
+int_outdir <- ensure_dir(here::here("results", "integration"))
+write.table(q2p_e4, file.path(int_outdir, "cadenza_real_joint_components_q2perm.tsv"),
+           sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(e4_boot$protein, file.path(int_outdir, "cadenza_real_loadings_protein_boot.tsv"),
+           sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(e4_boot$rna, file.path(int_outdir, "cadenza_real_loadings_rna_boot.tsv"),
+           sep = "\t", row.names = FALSE, quote = FALSE)
+save_fgsea_e4(e4_cadenza, here::here("results", "enrichment", "E4_pls_component1_mapman_cadenza.tsv"))
+```
+
 ------------------------------------------------------------------------
 
 ## 7. Not yet wired up here
@@ -1137,5 +1543,73 @@ write.table(e3_compare, file.path(outdir, "E3_cross_variety_discordance.tsv"),
 list.files(outdir)
 ```
 
-    [1] "E1_discordance_mapman_cadenza.tsv" "E1_discordance_mapman_norin.tsv"  
-    [3] "E3_cross_variety_discordance.tsv" 
+    [1] "E1_discordance_mapman_cadenza.tsv"   
+    [2] "E1_discordance_mapman_norin.tsv"     
+    [3] "E3_cross_variety_discordance.tsv"    
+    [4] "E4_pls_component1_mapman_cadenza.tsv"
+
+------------------------------------------------------------------------
+
+## 9. Summary and known issues (first successful render, 2026-08-25)
+
+**Annotation coverage.** MapMan reaches 4,643 / 4,882 of the 5,879 /
+6,105 detected proteins (Norin/Cadenza); GO/Pfam/InterPro reaches more
+(5,242 / 5,548) but is thinner per-term (see the caveats in the purpose
+section). 181 / 185 MapMan bins and 1,461 / 1,517 GO/Pfam/InterPro terms
+qualify for GSEA (size 5–500).
+
+**Results.**
+
+| Statistic                    | Norin: bins tested / padj\<0.05 | Cadenza: bins tested / padj\<0.05 |
+|------------------------------|---------------------------------|-----------------------------------|
+| `d_full` (E1)                | 168 / **13**                    | 174 / **12**                      |
+| `correlation` (E2)           | 168 / **2**                     | 174 / **5**                       |
+| `log2_amplitude` (E2)        | 64 / **0**\*\*                  | 79 / **0**\*\*                    |
+| PLS component-1 loading (E4) | not run – no validated axis     | 180 / **~19**                     |
+
+\*\* Not a null result – see the known issue below.
+
+**Bottom line:** real, modest discordance signal (E1: ~7–8% of tested
+bins significant vs. 5% expected by chance) and a clean, if smaller,
+`correlation` signal (E2). **E4 (added 2026-08-25) is the strongest hit
+rate of the four (~11%) and the most biologically legible** – its top
+bin, `stress.biotic`, is exactly what a validated shared RNA/protein
+axis over an infection time-course should surface, and only 6 of its ~19
+significant bins overlap E1’s, so it contributes information the
+distance-based statistics do not. The `log2_amplitude` arm of E2 and the
+raw `delta_NES` ranking in E3 are still not trustworthy as reported –
+both remain flagged inline with the specific fix, neither has been
+applied.
+
+**Known issues, not fixed in this pass (flagged only, per instruction to
+hold off on re-rendering):**
+
+1.  **`log2_amplitude` double-logs an already-log2 column** (§5) –
+    `amplitude` is signed and already log-scale; taking `log2()` of it
+    produces `NaN` for ~60% of genes, which are silently dropped,
+    leaving only ~40% of genes in that one GSEA and 0 significant bins
+    in either variety. Fix: rank on `amplitude` directly, no second
+    `log2()`.
+2.  **`longfmt_pathways` (GO/Pfam/InterPro, §2.3) is built but never
+    used** – no `run_fgsea_on_stat()` call in E1/E2/E3/E4 is passed
+    these gene sets; only the MapMan sets are actually tested. The
+    “secondary vocabulary” described in the purpose section is not yet
+    wired into any analysis.
+3.  **E3’s top-20 table is not filtered on significance** (§6) – it
+    ranks by raw `|delta_NES|`, and most of the current top rows have
+    `padj` near 1 in one or both varieties, so the table currently
+    surfaces noise as often as signal. Fix: filter to
+    `padj_norin < 0.05 | padj_cadenza < 0.05` before `slice_max()`.
+4.  **E4’s bin count is a range, not a fixed number** (§6b) –
+    `fgseaMultilevel`’s Monte Carlo p-value estimate moves one
+    borderline bin across `padj = 0.05` between otherwise-identical runs
+    (confirmed: a standalone run gave 20, the full in-notebook run gave
+    19, same top hits). Report as “~19–20,” not either number precisely,
+    unless `nperm`/the multilevel algorithm’s internal sampling is
+    increased to tighten the borderline estimate.
+
+**Deferred from the start** (§7, unchanged): kinetic archetype /
+amplitude enrichment (needs an `archetypes.tsv` this project does not
+yet write for real data) and the per-condition discordance heatmap
+(needs a per-condition distance export `gene_distance_shared_space.qmd`
+does not yet produce).
