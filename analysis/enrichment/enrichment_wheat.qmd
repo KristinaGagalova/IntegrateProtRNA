@@ -1,0 +1,478 @@
+---
+title: "Functional enrichment (fgsea) of RNA-protein integration statistics"
+author: "Kristina Gagalova"
+format:
+  gfm:
+    toc: true
+    code-tools: true
+    fig-dir: "figs"
+execute:
+  echo: true
+editor: visual
+---
+
+## Purpose and scope
+
+This notebook asks: **do the per-gene statistics already computed elsewhere in this project (discordance distance, kinetic amplitude, cross-variety comparison) concentrate in specific functional categories, more than chance would predict?**
+
+Every other notebook in `analysis/` classifies or ranks genes individually and then states, explicitly, where individual-gene calls are unsafe -- `kinetics_limited` in `analysis/kinetics_limited`, "not supported at the individual-gene level" for K5 in `kinetics_what_we_can_claim.qmd`. Gene-set enrichment is the standard fix for exactly that gap: aggregate a noisy per-gene statistic over a functional category and ask whether the *category* moves, which needs far less per-gene precision than an individual call does.
+
+The method is **not new** -- it is the same machinery already used in the companion project's variety-level enrichment write-up (`norinXcadenza-shared/analysis/rnaseq/wheat/Enrichment-varieties.md`): `fgsea::fgseaMultilevel()` on a ranked statistic, gene sets built with `check_id_overlap_annotations()` / `make_fgsea_annotation_table()` (`R/Enrichment.R`, ported verbatim). What is new here is *which* statistic gets ranked -- not DE `t`, but the gene-distance and kinetic statistics this project's own pipeline produces.
+
+### What this pulls in from elsewhere
+
+| Source                                                                | What it provides                                                                                                 |
+|----------------------------|--------------------------------------------|
+| `data/annotations/*-CS-rbh-final-MAPMAN.tsv.gz`                       | MapMan/Mercator bins (`MapCave.bin.name`), wide format -- the primary vocabulary, matching the upstream notebook |
+| `data/annotations/*-CS-rbh-final.tsv.gz`                              | GO / Pfam / InterPro, long format -- secondary vocabulary, see caveats below                                     |
+| `results/gene-distance/{norin,cadenza}_gene_distances_8condition.csv` | `d_full`, `d_pca2`, `d_umap`, `correlation`, `amplitude` per gene (`analysis/gene-distance`)                     |
+| `data/real/norin_cadenza_rbh-clean.csv`                               | Direct Norin\<-\>Cadenza reciprocal-best-hit map, for cross-variety comparison                                   |
+
+### Annotation caveats, established before running anything
+
+A profiling pass over these annotation files (done before writing this notebook) found:
+
+1.  **The detected proteome is the binding constraint.** Norin: 5,879 quantified proteins, 4,561 annotated. Cadenza: 6,105 quantified, 5,548 annotated. Every gene set below is built **from the detected proteome only**, never the whole genome -- an enrichment background of "everything IWGSC ever annotated" would just recover "MS detects abundant, well-known proteins" (ribosome, Rubisco, glycolysis).
+2.  **GO in these files is thin and unpropagated.** Within the Norin proteome universe there are only 48 GO:BP terms with \>= 10 genes (MF 88, CC 17), and terms are raw InterPro2GO leaves, not ancestor-propagated (`GO:0008152     metabolic process` sits alongside its own child terms as a direct annotation). GO is kept here as a secondary, coarser cross-check only.
+3.  **MapMan/Mercator is the primary vocabulary** for exactly this reason -- it is purpose-built, hand-curated, and richer for wheat than raw InterPro2GO. This mirrors the choice already made in the companion project's own enrichment notebook.
+4.  **RBH is many-to-many.** 408 of 4,561 Norin proteome genes map to more than one CS v2.1 gene (up to 6). `check_id_overlap_annotations()` already handles this (the `mixed_terms` status), so it is not re-solved here.
+
+------------------------------------------------------------------------
+
+## 1. Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+if (!requireNamespace("here", quietly = TRUE)) stop("package 'here' required")
+
+## RENV_PROJECT must be set before sourcing activate.R, or renv treats this
+## subdirectory as the project and bootstraps an empty library.
+if (file.exists(here::here("renv", "activate.R"))) {
+  Sys.setenv(RENV_PROJECT = here::here())
+  source(here::here("renv", "activate.R"))
+}
+
+source(here::here("R", "utils.R"))
+need_pkgs(c("dplyr", "tidyr", "stringr", "tibble", "data.table", "readr",
+            "fgsea", "ggplot2", "patchwork", "ggrepel", "BiocParallel"))
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(ggplot2)
+library(fgsea)
+library(patchwork)
+
+source(here::here("R", "Enrichment.R"))
+
+set.seed(20260825)
+
+ANNO_DIR <- here::here("data", "annotations")
+GD_DIR   <- here::here("results", "gene-distance")
+REAL_DIR <- here::here("data", "real")
+
+#' Canonical gene-ID normalisation for this notebook.
+#'
+#' Four ID conventions have to be reconciled here, and they disagree in both
+#' CASE and SUFFIX:
+#'   proteomics matrices  TraesNOR1A03G00000030            (upper, bare)
+#'   MapMan (Norin)       TraesNOR3B03G01717390.1.CDS1     (upper, isoform+CDS)
+#'   MapMan (Cadenza)     TraesCAD_scaffold_081796_01G000400.1  (upper, isoform)
+#'   gene-distance table  TraesNOR1D03G00570400            (upper, bare)
+#'
+#' `check_id_overlap_annotations()` lowercases internally, so lowercase is the
+#' project-wide join key. EVERY id that participates in a join must go through
+#' this function -- normalising only one side is a silent zero-overlap join,
+#' which is exactly what produced empty gene sets on the first run.
+strip_isoform <- function(x) {
+  x <- tolower(x)
+  x <- gsub("\\.cds[0-9]+$", "", x)
+  x <- gsub("\\.[0-9]+$", "", x)
+  x
+}
+
+#' Guard against the silent-empty-join failure mode. fgsea returns 0 rows
+#' rather than erroring when nothing overlaps, so the check has to be explicit.
+assert_overlap <- function(a, b, what) {
+  n <- length(intersect(a, b))
+  if (n == 0) stop("zero overlap in ", what,
+                   " -- check ID normalisation (case / isoform suffix)",
+                   call. = FALSE)
+  cat(sprintf("%-46s %6d ids overlap\n", what, n))
+  invisible(n)
+}
+```
+
+------------------------------------------------------------------------
+
+## 2. Annotation universes
+
+### 2.1 Detected proteome per variety
+
+The enrichment background throughout this notebook -- gene sets are built *only* from genes actually quantified in the proteomics data, never the whole genome.
+
+```{r}
+#| label: proteome-universe
+
+## strip_isoform() here is what makes the universe join-compatible with the
+## annotation tables; without it every downstream %in% silently matches nothing.
+read_id_col <- function(path) {
+  x <- data.table::fread(path, select = 1L, header = TRUE)
+  unique(strip_isoform(x[[1]]))
+}
+
+universe <- list(
+  norin   = read_id_col(file.path(REAL_DIR, "norin-prot.csv")),
+  cadenza = read_id_col(file.path(REAL_DIR, "cadenza-prot.csv"))
+)
+
+cat("Norin proteome:   ", length(universe$norin),   "quantified proteins\n")
+cat("Cadenza proteome: ", length(universe$cadenza), "quantified proteins\n")
+```
+
+### 2.2 MapMan/Mercator bins (primary vocabulary)
+
+Wide-format annotation, one row per gene, `MapCave.bin.name` carries the MapMan bin. Gene IDs here carry a `.<isoform>.CDS<n>` suffix that the upstream `check_id_overlap_annotations()` does not fully strip (it only removes the `.CDS<n>` part) -- so isoform suffixes are stripped explicitly here first, to match the bare gene IDs used everywhere else in this project.
+
+```{r}
+#| label: load-mapman
+#| message: false
+
+load_mapman <- function(variety) {
+  path <- file.path(ANNO_DIR, sprintf("%s-CS-rbh-final-MAPMAN.tsv.gz",
+                                       tools::toTitleCase(variety)))
+  df <- readr::read_tsv(path, show_col_types = FALSE, progress = FALSE)
+  df[[variety]] <- strip_isoform(df[[variety]])
+  assert_overlap(df[[variety]], universe[[variety]],
+                 sprintf("MapMan x %s proteome", variety))
+  df[df[[variety]] %in% universe[[variety]], ]
+}
+
+mapman <- list(
+  norin   = load_mapman("norin"),
+  cadenza = load_mapman("cadenza")
+)
+
+cat("\nNorin MapMan rows restricted to proteome:  ", nrow(mapman$norin), "\n")
+cat("Cadenza MapMan rows restricted to proteome:", nrow(mapman$cadenza), "\n")
+```
+
+Build the fgsea gene-set table exactly as the upstream notebook does -- `check_id_overlap_annotations()` classifies each gene as `specific` / `generic` / `mixed_generic` / `mixed_terms` / `non.annotated`, and `make_fgsea_annotation_table()` collapses that to one `term_for_fgsea` string per gene, ready to `split()` into pathways.
+
+```{r}
+#| label: mapman-fgsea-table
+
+build_mapman_annotation_table <- function(variety) {
+  genes_df <- tibble(gene_id = universe[[variety]])
+
+  res <- check_id_overlap_annotations(
+    ranked_df       = genes_df,
+    annotation_df   = mapman[[variety]],
+    rank_gene_col   = "gene_id",
+    assign_gene_col = variety,
+    term_col        = "MapCave.bin.name",
+    not_assigned_terms = c("not assigned.unknown", "not assigned.no ontology")
+  )
+
+  make_fgsea_annotation_table(res$checked_df, id_col = "gene_id")
+}
+
+mapman_anno_table <- list(
+  norin   = build_mapman_annotation_table("norin"),
+  cadenza = build_mapman_annotation_table("cadenza")
+)
+
+lapply(mapman_anno_table, function(x) table(x$status))
+```
+
+### 2.3 GO / Pfam / InterPro (secondary vocabulary)
+
+Long format: one row per (gene, annotation-type). Restricted to the detected proteome, split by `f.type` (and by `f.domain` for Gene Ontology), each category built into its own set of pathways.
+
+```{r}
+#| label: load-go-pfam-interpro
+#| message: false
+
+load_longfmt <- function(variety) {
+  path <- file.path(ANNO_DIR, sprintf("%s-CS-rbh-final.tsv.gz",
+                                       tools::toTitleCase(variety)))
+  dt <- data.table::fread(path, sep = "\t", header = TRUE, quote = "")
+  id_col <- variety
+  dt[[id_col]] <- strip_isoform(dt[[id_col]])
+  assert_overlap(dt[[id_col]], universe[[variety]],
+                 sprintf("GO/Pfam/InterPro x %s proteome", variety))
+  dt[dt[[id_col]] %in% universe[[variety]]]
+}
+
+longfmt <- list(
+  norin   = load_longfmt("norin"),
+  cadenza = load_longfmt("cadenza")
+)
+
+#' Build one fgsea pathway list from the long-format annotation.
+#' @param f_type "Pfam", "InterPro", or "Gene Ontology"
+#' @param go_domain restrict to a GO domain (BP/MF/CC); ignored otherwise
+build_pathways_longfmt <- function(dt, id_col, f_type, go_domain = NULL,
+                                    min_size = 5, max_size = 500) {
+  sub <- dt[dt$f.type == f_type]
+  if (!is.null(go_domain)) sub <- sub[sub$f.domain == go_domain]
+  sub <- sub[!is.na(sub$f.name) & sub$f.name != ""]
+
+  label <- ifelse(is.na(sub$f.label) | sub$f.label == "", sub$f.name, sub$f.label)
+  prefix <- if (!is.null(go_domain)) sprintf("GO:%s", go_domain) else f_type
+  sub$term <- sprintf("%s: %s (%s)", prefix, label, sub$f.name)
+
+  sets <- split(sub[[id_col]], sub$term)
+  sets <- lapply(sets, unique)
+  sets[lengths(sets) >= min_size & lengths(sets) <= max_size]
+}
+
+build_all_longfmt_pathways <- function(variety) {
+  dt <- longfmt[[variety]]
+  c(
+    build_pathways_longfmt(dt, variety, "Pfam"),
+    build_pathways_longfmt(dt, variety, "InterPro"),
+    build_pathways_longfmt(dt, variety, "Gene Ontology", "BP"),
+    build_pathways_longfmt(dt, variety, "Gene Ontology", "MF"),
+    build_pathways_longfmt(dt, variety, "Gene Ontology", "CC")
+  )
+}
+
+longfmt_pathways <- list(
+  norin   = build_all_longfmt_pathways("norin"),
+  cadenza = build_all_longfmt_pathways("cadenza")
+)
+
+cat("Norin:   ", length(longfmt_pathways$norin),   "Pfam/InterPro/GO sets (proteome, size 5-500)\n")
+cat("Cadenza: ", length(longfmt_pathways$cadenza), "Pfam/InterPro/GO sets (proteome, size 5-500)\n")
+```
+
+------------------------------------------------------------------------
+
+## 3. Load the integration statistics to rank on
+
+`analysis/gene-distance/gene_distance_shared_space.qmd` already produced, per gene, a shared-space discordance distance (`d_full`, full-dimensional; `d_pca2`/`d_umap`, low-dimensional), a total-least-squares `correlation` between the RNA and protein condition profiles, and an `amplitude` (protein range relative to RNA range). These are real-data outputs, already on disk -- nothing is recomputed here.
+
+```{r}
+#| label: load-gene-distance
+
+gene_distance <- list(
+  norin   = read.csv(file.path(GD_DIR, "norin_gene_distances_8condition.csv")),
+  cadenza = read.csv(file.path(GD_DIR, "cadenza_gene_distances_8condition.csv"))
+)
+
+lapply(gene_distance, function(d) { d$gene_id <- strip_isoform(d$gene_id); nrow(d) })
+gene_distance <- lapply(gene_distance, function(d) { d$gene_id <- strip_isoform(d$gene_id); d })
+
+str(gene_distance$norin)
+```
+
+------------------------------------------------------------------------
+
+## 4. E1 -- Discordance GSEA: which bins go out of RNA/protein sync?
+
+Rank every gene by `d_full` (higher = more discordant) and ask which MapMan bins sit systematically toward one end of that ranking -- no arbitrary top-decile cutoff, the full ranking is used, exactly as `fgsea` is designed for.
+
+```{r}
+#| label: e1-run-fgsea
+#| message: false
+
+#' @param score_type passed to fgsea. "std" for a SIGNED statistic (enrichment
+#'   can be at either tail); "pos" for a strictly NON-NEGATIVE one. Getting this
+#'   wrong is not cosmetic: with an all-positive statistic under "std", fgsea's
+#'   running sum can only ever walk one way, so the two-tailed null it compares
+#'   against is the wrong null and the p-values are not interpretable. `d_full`
+#'   is a Euclidean distance and so is strictly positive -- it needs "pos".
+run_fgsea_on_stat <- function(df, stat_col, pathways, min_size = 5, max_size = 500,
+                              score_type = c("std", "pos"), decreasing = TRUE) {
+  score_type <- match.arg(score_type)
+
+  ranks <- setNames(df[[stat_col]], df$gene_id)
+  ranks <- ranks[is.finite(ranks)]
+  ranks <- sort(ranks, decreasing = decreasing)
+
+  assert_overlap(names(ranks), unlist(pathways, use.names = FALSE),
+                 sprintf("ranked %s x gene sets", stat_col))
+
+  fgseaMultilevel(
+    pathways  = pathways,
+    stats     = ranks,
+    minSize   = min_size,
+    maxSize   = max_size,
+    scoreType = score_type,
+    nproc     = 1
+  )
+}
+
+e1_mapman_pathways <- lapply(mapman_anno_table, function(tab) {
+  tab <- tab %>% filter(keep_for_fgsea, !is.na(term_for_fgsea))
+  sets <- split(tab$gene_ids, tab$term_for_fgsea)
+  sets <- lapply(sets, unique)
+  sets[lengths(sets) >= 5 & lengths(sets) <= 500]
+})
+
+cat("MapMan gene sets (size 5-500) --",
+    "Norin:", length(e1_mapman_pathways$norin),
+    "| Cadenza:", length(e1_mapman_pathways$cadenza), "\n")
+
+## d_full is a Euclidean distance -> strictly positive -> scoreType "pos".
+e1_norin   <- run_fgsea_on_stat(gene_distance$norin,   "d_full", e1_mapman_pathways$norin,
+                                score_type = "pos")
+e1_cadenza <- run_fgsea_on_stat(gene_distance$cadenza, "d_full", e1_mapman_pathways$cadenza,
+                                score_type = "pos")
+```
+
+```{r e1-bubble, fig.width=30, fig.height=15, fig.align='center'}
+#| label: e1-bubble
+
+e1_plots <- list(
+  Norin   = plot_fgsea_bubble(e1_norin,   top_n = 25, plot_title = "Norin: d_full discordance"),
+  Cadenza = plot_fgsea_bubble(e1_cadenza, top_n = 25, plot_title = "Cadenza: d_full discordance")
+)
+e1_plots <- Filter(Negate(is.null), e1_plots)
+if (length(e1_plots) > 0) Reduce(`|`, e1_plots)
+```
+
+------------------------------------------------------------------------
+
+## 5. E2 -- Three-metric decomposition: distance, correlation, amplitude
+
+`d_full` alone conflates two different failure modes: a gene can be far in shared space because its RNA and protein *shapes* differ (low correlation -- lag/timing mismatch) or because the shapes agree but the *scale* differs (high correlation, extreme amplitude -- buffering/amplification). Running `fgsea` on each statistic separately is the direct way to ask which bins drive which failure mode.
+
+Reading the three together is the point: a bin that is high on `d_full` **and** low on `correlation` is going out of sync in *timing*; a bin high on `d_full` but with correlation intact and `log2_amplitude` displaced is going out of sync in *magnitude* -- which is the buffered/amplified axis the kinetic model in `analysis/kinetics_limited` estimates per gene, reached here at category level where the per-gene call is not safe.
+
+```{r}
+#| label: e2-run-fgsea
+#| message: false
+
+## `amplitude` is a RATIO of protein to RNA response range: 1 = matched, <1
+## buffered, >1 amplified. On the raw scale it is positive and multiplicatively
+## symmetric around 1, so a rank on it is dominated by the amplified tail and
+## compresses the buffered half into (0, 1). log2 puts buffering and
+## amplification on symmetric, additive footing around 0 -- the same axis the
+## kinetic model's `a` uses -- and makes scoreType "std" the correct choice.
+gene_distance <- lapply(gene_distance, function(d) {
+  d$log2_amplitude <- log2(d$amplitude)
+  d
+})
+
+## Signed statistics take "std"; the strictly-positive distance takes "pos".
+e2_spec <- list(
+  d_full         = "pos",
+  correlation    = "std",
+  log2_amplitude = "std"
+)
+
+e2_results <- lapply(names(gene_distance), function(v) {
+  lapply(names(e2_spec), function(s) {
+    run_fgsea_on_stat(gene_distance[[v]], s, e1_mapman_pathways[[v]],
+                      score_type = e2_spec[[s]])
+  }) |> setNames(names(e2_spec))
+})
+names(e2_results) <- names(gene_distance)
+e2_stats <- names(e2_spec)
+```
+
+```{r e2-bubble, fig.width=30, fig.height=15, fig.align='center'}
+#| label: e2-bubble
+
+e2_plots <- lapply(names(e2_results), function(v) {
+  lapply(e2_stats, function(s) {
+    plot_fgsea_bubble(e2_results[[v]][[s]], top_n = 15,
+                      plot_title = sprintf("%s: %s", tools::toTitleCase(v), s))
+  })
+})
+names(e2_plots) <- names(e2_results)
+
+e2_plots_flat <- Filter(Negate(is.null), unlist(e2_plots, recursive = FALSE))
+if (length(e2_plots_flat) > 0) Reduce(`|`, e2_plots_flat)
+```
+
+------------------------------------------------------------------------
+
+## 6. E3 -- Cross-variety differential enrichment
+
+Join the two varieties' `d_full` rankings on the direct Norin\<-\>Cadenza reciprocal-best-hit map (`data/real/norin_cadenza_rbh-clean.csv`) and compare NES for each MapMan bin between varieties -- which functional categories are discordant in one variety but not the other.
+
+```{r}
+#| label: e3-cross-variety
+#| message: false
+
+rbh_nc <- read.csv(file.path(REAL_DIR, "norin_cadenza_rbh-clean.csv"))
+rbh_nc$query  <- strip_isoform(rbh_nc$query)
+rbh_nc$target <- strip_isoform(rbh_nc$target)
+
+cat("Norin<->Cadenza 1:1 RBH pairs:", nrow(distinct(rbh_nc, query, target)), "\n")
+
+e3_table <- function(res, label) {
+  as.data.frame(res) %>%
+    transmute(pathway, NES, padj, size) %>%
+    rename_with(~ paste0(., "_", label), c(NES, padj, size))
+}
+
+e3_compare <- full_join(
+  e3_table(e1_norin,   "norin"),
+  e3_table(e1_cadenza, "cadenza"),
+  by = "pathway"
+) %>%
+  mutate(delta_NES = NES_norin - NES_cadenza) %>%
+  arrange(desc(abs(delta_NES)))
+
+head(e3_compare, 20)
+```
+
+```{r e3-plot, fig.width=15, fig.height=15, fig.align='center'}
+#| label: e3-plot
+
+
+e3_top <- e3_compare %>%
+  filter(!is.na(delta_NES)) %>%
+  slice_max(abs(delta_NES), n = 20)
+
+if (nrow(e3_top) > 0) {
+  ggplot(e3_top, aes(x = NES_norin, y = NES_cadenza)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point(aes(size = abs(delta_NES)), alpha = 0.75) +
+    ggrepel::geom_text_repel(aes(label = pathway), size = 3, max.overlaps = 15) +
+    theme_bw(base_size = 13) +
+    labs(title = "Discordance NES: Norin vs Cadenza",
+         subtitle = "Off-diagonal = variety-specific discordance in this MapMan bin",
+         x = "NES (Norin, d_full)", y = "NES (Cadenza, d_full)")
+}
+```
+
+------------------------------------------------------------------------
+
+## 7. Not yet wired up here
+
+Two items from the enrichment-extension catalogue are deliberately **not** implemented in this pass, because the inputs they need do not exist on disk yet -- rather than fake them, they are listed here as the next step.
+
+-   **Kinetic archetype / amplitude enrichment** (rank by `log2(a)` or `t_half`, or ORA on archetype membership). `analysis/kinetics_limited/de_proteomics_wheat.qmd` computes archetype classification and per-gene amplitude `a_hat` for the real wheat data (482/431 amplified, 1278/978 concordant, etc. -- Cadenza/Norin), but classifies **inline in that notebook's own session** and never writes an `archetypes.tsv` for real data (unlike the simulated pipeline's `R/05_concordance_archetypes.R`, which does). Before A1/A4 from the catalogue can run here, that classification block needs factoring out into a function that writes `results/kinetics/archetypes_{norin,cadenza}.tsv`.
+-   **Per-condition discordance heatmap** (8 separate rankings, one per treatment x timepoint cell, MapMan bins x cells). The saved `*_gene_distances_8condition.csv` files carry only the *aggregate* `d_full`/`correlation`/`amplitude` per gene, not the per-condition contribution to that distance -- that decomposition exists only inside `gene_distance_shared_space.qmd` §8b/V3c (in-session, not saved). Needs a `results/gene-distance/*_per_condition_contrib.csv` export from that notebook first.
+
+------------------------------------------------------------------------
+
+## 8. Outputs
+
+```{r}
+#| label: write-outputs
+
+outdir <- here::here("results", "enrichment")
+ensure_dir(outdir)
+
+save_fgsea <- function(res, path) {
+  df <- as.data.frame(res)
+  df[] <- lapply(df, function(x) if (is.list(x)) sapply(x, paste, collapse = ";") else x)
+  write.table(df, path, sep = "\t", row.names = FALSE, quote = FALSE)
+}
+
+save_fgsea(e1_norin,   file.path(outdir, "E1_discordance_mapman_norin.tsv"))
+save_fgsea(e1_cadenza, file.path(outdir, "E1_discordance_mapman_cadenza.tsv"))
+write.table(e3_compare, file.path(outdir, "E3_cross_variety_discordance.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+list.files(outdir)
+```

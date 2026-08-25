@@ -14,10 +14,12 @@ core_only <- length(args) && args[1] == "core"
 
 cran <- c("yaml", "ggplot2", "pheatmap", "matrixStats", "reshape2", "cluster",
           "igraph", "RColorBrewer", "BiocManager", "remotes", "data.table",
-          "OmicsPLS", "corpcor", "MASS")
+          "OmicsPLS", "corpcor", "MASS", "patchwork", "ggrepel", "stringr",
+          "tidyr", "dplyr", "tibble", "glmnet", "ranger", "readr")
 
 bioc <- c("limma", "edgeR", "DESeq2", "vsn", "impute", "sva", "IHW",
-          "MOFA2", "mixOmics", "ComplexHeatmap", "preprocessCore")
+          "MOFA2", "mixOmics", "ComplexHeatmap", "preprocessCore",
+          "fgsea", "GO.db", "AnnotationDbi", "GOSemSim", "BiocParallel")
 
 ## imputeLCMD carries QRILC / MinProb; it was archived from CRAN at one point,
 ## so install it from source if the binary is unavailable.
