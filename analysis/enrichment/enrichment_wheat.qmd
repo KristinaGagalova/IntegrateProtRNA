@@ -587,6 +587,139 @@ save_fgsea_e4(e4_cadenza, here::here("results", "enrichment", "E4_pls_component1
 
 ------------------------------------------------------------------------
 
+## 6c. E5 -- A second ML-derived ranking: the condition-aligned autoencoder (both varieties)
+
+E4 used PLS because D7 validated it and the reference notebook's PLS-based sample-matching was the specific method under audit. But `dimensionality_reduction_wheat.qmd`'s own D4 permutation-null table (already computed, on the real wheat data, before this section existed) shows something E4 could not: at `k = 2`, the **condition-aligned autoencoder** gives **Norin** a validated cross-omics signal (Q² = 0.1474, permutation-null 95th pctile = -0.0088, **p_perm = 0.02**) where plain PLS found nothing (D7: p = 0.06). Cadenza validates too, and more strongly (Q² = 0.3205, p_perm = 0.02). This is a direct, concrete answer to "any plans to use the autoencoder model": yes, specifically this one, and specifically because it is the one AE variant that already cleared both bars that disqualified the others (D6: seed-to-seed reproducibility 0.9992, versus 0.75-0.84 for AE-vae/AE-tanh).
+
+Two caveats carried over from that notebook, stated before running anything new here:
+
+-   **This is the condition-mean-level use of the architecture.** D9 (`dimensionality_reduction_wheat.qmd` Sec.7d) found that fitting the model at the replicate level it was actually designed for (real n=3 centroid alignment, not a degenerate n=1-per-cell alignment) gives a *lower* Q² (Cadenza 0.2619, Norin 0.0894) than the condition-mean fit used for the p_perm numbers above. Used here anyway, matching D4's own validated scheme exactly -- the alternative would require building a fresh permutation null for the replicate-level fit, not yet done anywhere.
+-   **k = 1 is used below, not the validated k = 2.** At k \>= 2 the autoencoder's latent dimensions carry no ordering or identity constraint the way PLS's sequentially-deflated components do, so which resampled bootstrap dimension corresponds to which point-estimate dimension is not well defined -- a real obstacle to the same loading-stability check E4 relies on. k = 1 sidesteps it (only a sign ambiguity remains, and `align_sign()` already handles that generically), at the cost of needing its own, fresh Q²/permutation-null validation -- the k = 2 result above does not carry over automatically. That validation is what the next chunk does, before any gene loading is examined, in the same order as E4.
+
+```{r}
+#| label: e5-setup
+#| message: false
+
+source(here::here("R", "ae_utils.R"))
+
+## Cadenza's prepared data already exists from E4 (cad_prep) -- reused, not
+## recomputed. Norin needs its own prepare_variety() call.
+nor_prep <- prepare_variety("norin", DESIGN)
+cd_r_nor <- nor_prep$meta[colnames(nor_prep$qc_rna$vst), , drop = FALSE]
+cd_p_nor <- nor_prep$meta[colnames(nor_prep$imputed$mixed), , drop = FALSE]
+cells_e5 <- levels(nor_prep$meta$cell)
+
+VAR_E5 <- list(
+  cadenza = list(prep = cad_prep, cd_r = cd_r_e4, cd_p = cd_p_e4),
+  norin   = list(prep = nor_prep, cd_r = cd_r_nor, cd_p = cd_p_nor)
+)
+
+hv_e5 <- lapply(VAR_E5, function(v) {
+  n_hvg <- min(2000, nrow(v$prep$qc_rna$vst))
+  list(hv_r = top_variable(v$prep$qc_rna$vst, n_hvg),
+      hv_p = rownames(v$prep$imputed$mixed))
+})
+```
+
+```{r}
+#| label: e5-component-validation
+#| message: false
+
+## Fresh Q2 + permutation null at k = 1, condition-mean level -- the k = 2
+## result quoted above does not validate k = 1. Same LOCO + permute_Y_by_cell
+## machinery dimensionality_reduction_wheat.qmd's D4/D7 use, extracted
+## verbatim into R/ae_utils.R. nperm = 29 matches that notebook's own stated
+## setting (its D4 permutation-null chunk's code currently runs 49; 29 is
+## used here for tractable runtime and is the value that notebook's own
+## table caption describes).
+q2p_e5 <- do.call(rbind, lapply(names(VAR_E5), function(nm) {
+  v  <- VAR_E5[[nm]]
+  Xc <- t(cell_means(v$prep$qc_rna$vst[hv_e5[[nm]]$hv_r, ],   v$cd_r))
+  Yc <- t(cell_means(v$prep$imputed$mixed[hv_e5[[nm]]$hv_p, ], v$cd_p))
+  res <- cond_ae_q2_perm(Xc, Yc, k = 1, seeds = 1:3, epochs = 3000,
+                        nperm = 29, perm_epochs = 600, seed_base = 5000)
+  cbind(variety = nm, res)
+}))
+q2p_e5
+```
+
+**Reading the table.** Both varieties validate at k = 1: **Cadenza** Q² = 0.2082 (null 95th pctile -0.3059, **p = 0.033**), **Norin** Q² = 0.0889 (null 95th pctile -0.1753, **p = 0.033**). Neither result is contingent on the k = 2 number quoted above -- this is a fresh LOCO + permutation test at k = 1 specifically, and it independently confirms the same qualitative finding: the condition-aligned AE finds real cross-omics signal in Norin where PLS (D7, p = 0.06) does not.
+
+```{r}
+#| label: e5-boot-loadings
+#| message: false
+
+## Restricted to the variety/varieties that validated at k = 1 above -- see
+## the reading immediately above this chunk for which that is.
+e5_varieties <- q2p_e5$variety[q2p_e5$p_perm < 0.05]
+cat("Varieties validated at k = 1:", paste(e5_varieties, collapse = ", "), "\n")
+
+e5_boot <- setNames(lapply(e5_varieties, function(nm) {
+  v <- VAR_E5[[nm]]
+  cond_ae_boot_loadings(v$prep$qc_rna$vst, v$prep$imputed$mixed,
+                        v$cd_r, v$cd_p, cells_e5,
+                        hv_e5[[nm]]$hv_r, hv_e5[[nm]]$hv_p,
+                        k = 1, B = 100, epochs = 1000, seed = 20260825)
+}), e5_varieties)
+
+for (nm in e5_varieties) {
+  cat("\n---", nm, "loading/stability summary ---\n")
+  print(summary(e5_boot[[nm]]$protein$loading))
+  print(summary(e5_boot[[nm]]$protein$stability))
+}
+```
+
+```{r}
+#| label: e5-run-fgsea
+#| message: false
+
+e5_results <- setNames(lapply(e5_varieties, function(nm) {
+  prot <- e5_boot[[nm]]$protein
+  prot$gene_id <- strip_isoform(prot$feature)
+  run_fgsea_on_stat(prot, "loading", e1_mapman_pathways[[nm]], score_type = "std")
+}), e5_varieties)
+
+for (nm in e5_varieties) {
+  cat(nm, "-- MapMan bins tested:", nrow(e5_results[[nm]]), "| padj < 0.05:",
+     sum(e5_results[[nm]]$padj < 0.05, na.rm = TRUE), "\n")
+}
+```
+
+```{r e5-bubble, fig.width=14, fig.height=8, fig.align='center'}
+#| label: e5-bubble
+
+e5_plots <- Filter(Negate(is.null), lapply(e5_varieties, function(nm)
+  plot_fgsea_bubble(e5_results[[nm]], top_n = 20,
+                    plot_title = sprintf("%s: condition-aligned AE (k=1) loading",
+                                        tools::toTitleCase(nm)))))
+if (length(e5_plots) > 0) Reduce(`|`, e5_plots)
+```
+
+### Result -- a genuine negative finding: real aggregate signal, unstable per-gene loadings
+
+Both varieties give the **same result, independently**: mean bootstrap-loading stability of 0.502 (Cadenza) and 0.503 (Norin) -- indistinguishable from a coin flip -- versus PLS's 0.92 for the same top-100-gene check in E4. Zero of the top-100 \|loading\| genes reach stability \>= 0.9 in either variety (E4's PLS component had 100/100). Consequently `fgsea` finds **0 significant MapMan bins in either variety** (0/180 Cadenza, 0/177 Norin) -- not because there is no shared signal (the Q²/permutation test above says there is), but because the per-gene loadings that would have to carry a gene-set signal do not reproduce across resamples.
+
+**Why PLS's loadings are stable and this model's are not, despite both resting on the same validated resampling scheme.** PLS's NIPALS iteration provably converges to the dominant direction of the cross-block covariance, so resampled fits land on essentially the same direction (up to the sign `align_sign()` corrects for). `cond_ae_fit()`, even at k = 1 and even though the resulting *map* is linear, is trained by Adam gradient descent on a **non-convex joint objective** over four separately-initialised weight matrices (`Wr, Ar, Wp, Ap`) from a **different random initialisation on every bootstrap draw** (`seed = seed + b`). Nothing in that objective anchors which of the (infinitely many, loss-equivalent) `(Wr, Ap)` factorisations a given run converges to beyond a global sign, which `align_sign()` does correct -- the near-exactly-0.5 mean in *both* independent variety runs is the signature of individual genes' relative signs within the vector varying freely across runs, not merely a global sign ambiguity slipping past the alignment step. This was not chased further with longer bootstrap-draw training (1000 epochs here, versus the 3000 used to validate Q² above) because two independent varieties landing on almost the identical \~0.50 value is itself evidence of a structural property of this optimiser, not a convergence budget that a few more epochs would fix -- worth confirming if this model is revisited, but not assumed here.
+
+**The honest bottom line, and the direct answer to "any plans to use the autoencoder model":** yes, and it was worth doing -- it is a real, validated way to detect *that* cross-omics signal exists (and, for Norin, the only method in this project that finds any), but **not**, at least with this training procedure, a source of individual-gene or gene-set-level information the way PLS's component is. That asymmetry -- a method can validate at the aggregate level and still fail the per-gene stability bar E4 introduced -- is itself the finding, and it is exactly the kind of check this project's own discipline (validate before using, at every level you intend to make a claim at) is built to catch.
+
+```{r}
+#| label: e5-outputs
+
+write.table(q2p_e5, file.path(int_outdir, "cond_ae_k1_q2perm.tsv"),
+           sep = "\t", row.names = FALSE, quote = FALSE)
+for (nm in e5_varieties) {
+  write.table(e5_boot[[nm]]$protein,
+             file.path(int_outdir, sprintf("%s_real_loadings_protein_ae_k1_boot.tsv", nm)),
+             sep = "\t", row.names = FALSE, quote = FALSE)
+  save_fgsea_e4(e5_results[[nm]],
+               here::here("results", "enrichment",
+                         sprintf("E5_condAE_k1_mapman_%s.tsv", nm)))
+}
+```
+
+------------------------------------------------------------------------
+
 ## 7. Not yet wired up here
 
 Two items from the enrichment-extension catalogue are deliberately **not** implemented in this pass, because the inputs they need do not exist on disk yet -- rather than fake them, they are listed here as the next step.
@@ -626,22 +759,24 @@ list.files(outdir)
 
 **Results.**
 
-| Statistic                    | Norin: bins tested / padj\<0.05 | Cadenza: bins tested / padj\<0.05 |
-|------------------------------|---------------------------------|-----------------------------------|
-| `d_full` (E1)                | 168 / **13**                    | 174 / **12**                      |
-| `correlation` (E2)           | 168 / **2**                     | 174 / **5**                       |
-| `log2_amplitude` (E2)        | 64 / **0**\*\*                  | 79 / **0**\*\*                    |
-| PLS component-1 loading (E4) | not run -- no validated axis    | 180 / **\~19**                    |
+| Statistic                               | Norin: bins tested / padj\<0.05 | Cadenza: bins tested / padj\<0.05 |
+|-----------------------------------------|---------------------------------|-----------------------------------|
+| `d_full` (E1)                           | 168 / **13**                    | 174 / **12**                      |
+| `correlation` (E2)                      | 168 / **2**                     | 174 / **5**                       |
+| `log2_amplitude` (E2)                   | 64 / **0**\*\*                  | 79 / **0**\*\*                    |
+| PLS component-1 loading (E4)            | not run -- no validated axis    | 180 / **\~19**                    |
+| Condition-aligned AE (k=1) loading (E5) | 177 / **0**\*\*\*               | 180 / **0**\*\*\*                 |
 
-\*\* Not a null result -- see the known issue below.
+\*\* Not a null result -- see known issue 1 below. \*\*\* Also not a null result of "no signal" -- the *aggregate* Q² validates in both varieties (Cadenza p=0.033, Norin p=0.033); the 0 reflects unstable per-gene loadings, not absence of shared signal. See known issue 5.
 
-**Bottom line:** real, modest discordance signal (E1: \~7--8% of tested bins significant vs. 5% expected by chance) and a clean, if smaller, `correlation` signal (E2). **E4 (added 2026-08-25) is the strongest hit rate of the four (\~11%) and the most biologically legible** -- its top bin, `stress.biotic`, is exactly what a validated shared RNA/protein axis over an infection time-course should surface, and only 6 of its \~19 significant bins overlap E1's, so it contributes information the distance-based statistics do not. The `log2_amplitude` arm of E2 and the raw `delta_NES` ranking in E3 are still not trustworthy as reported -- both remain flagged inline with the specific fix, neither has been applied.
+**Bottom line:** real, modest discordance signal (E1: \~7--8% of tested bins significant vs. 5% expected by chance) and a clean, if smaller, `correlation` signal (E2). **E4 remains the strongest hit rate (\~11%) and the most biologically legible** -- its top bin, `stress.biotic`, is exactly what a validated shared RNA/protein axis over an infection time-course should surface, and only 6 of its \~19 significant bins overlap E1's. **E5 (added 2026-08-25) is a genuine negative result worth keeping, not a bug**: the condition-aligned autoencoder is the one AE variant in `dimensionality_reduction_wheat.qmd` that already cleared both the Q²-validation and seed-reproducibility bars that disqualified AE-tanh/AE-vae, and it gives **Norin its first validated ML cross-omics signal anywhere in this project** (PLS found none, D7 p=0.06) -- but its per-gene loadings do not survive the same replicate-resampling stability check E4's PLS component passed easily (mean stability \~0.50, coin-flip, in both varieties independently, versus PLS's 0.92), so no gene-set claim is drawn from it. The `log2_amplitude` arm of E2 and the raw `delta_NES` ranking in E3 are still not trustworthy as reported -- both remain flagged inline with the specific fix, neither has been applied.
 
 **Known issues, not fixed in this pass (flagged only, per instruction to hold off on re-rendering):**
 
 1.  **`log2_amplitude` double-logs an already-log2 column** (§5) -- `amplitude` is signed and already log-scale; taking `log2()` of it produces `NaN` for \~60% of genes, which are silently dropped, leaving only \~40% of genes in that one GSEA and 0 significant bins in either variety. Fix: rank on `amplitude` directly, no second `log2()`.
-2.  **`longfmt_pathways` (GO/Pfam/InterPro, §2.3) is built but never used** -- no `run_fgsea_on_stat()` call in E1/E2/E3/E4 is passed these gene sets; only the MapMan sets are actually tested. The "secondary vocabulary" described in the purpose section is not yet wired into any analysis.
+2.  **`longfmt_pathways` (GO/Pfam/InterPro, §2.3) is built but never used** -- no `run_fgsea_on_stat()` call in E1/E2/E3/E4/E5 is passed these gene sets; only the MapMan sets are actually tested. The "secondary vocabulary" described in the purpose section is not yet wired into any analysis.
 3.  **E3's top-20 table is not filtered on significance** (§6) -- it ranks by raw `|delta_NES|`, and most of the current top rows have `padj` near 1 in one or both varieties, so the table currently surfaces noise as often as signal. Fix: filter to `padj_norin < 0.05 | padj_cadenza < 0.05` before `slice_max()`.
 4.  **E4's bin count is a range, not a fixed number** (§6b) -- `fgseaMultilevel`'s Monte Carlo p-value estimate moves one borderline bin across `padj = 0.05` between otherwise-identical runs (confirmed: a standalone run gave 20, the full in-notebook run gave 19, same top hits). Report as "\~19--20," not either number precisely, unless `nperm`/the multilevel algorithm's internal sampling is increased to tighten the borderline estimate.
+5.  **E5's per-gene loadings are unstable, likely a property of the optimiser, not (yet fully ruled out as) a training-budget artefact** (§6c) -- bootstrap draws used 1000 epochs (versus 3000 for the Q²-validated point estimate); two independent varieties landing on the same \~0.50 stability is evidence of a structural issue (non-convex joint optimisation from random per-draw initialisation, unlike PLS's NIPALS convergence guarantee) rather than under-training, but a longer-epoch bootstrap run would confirm this rather than assume it, and has not been done.
 
 **Deferred from the start** (§7, unchanged): kinetic archetype / amplitude enrichment (needs an `archetypes.tsv` this project does not yet write for real data) and the per-condition discordance heatmap (needs a per-condition distance export `gene_distance_shared_space.qmd` does not yet produce).
