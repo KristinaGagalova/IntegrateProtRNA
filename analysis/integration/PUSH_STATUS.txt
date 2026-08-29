@@ -1,0 +1,21 @@
+PUSH STATUS - Files Ready
+=========================
+Date: 2026-08-29
+
+Files available locally (in scratchpad/):
+✓ method_convergence_figure.qmd (UPDATED - Figure 5 embedded)
+✓ RUN_CONVERGENCE_ANALYSIS.R
+✓ EXTRACT_TOP_GENES_R_SCRIPT.R
+✓ generate_convergence_figure_RUNNABLE.R
+✓ QUARTO_UPDATES.md
+✓ LOCAL_EXECUTION_GUIDE.md
+✓ DIRECTORY_ORGANIZATION.md
+✓ EXTRACTION_SUMMARY.md
+
+Already on nectar (integration/):
+✓ kinetics_integrated_narrative_skeleton.md
+✓ SECTION_1_MOTIVATION_BIOLOGY.md
+✓ EXTRACT_TOP_GENES_R_SCRIPT.R
+✓ generate_convergence_figure_RUNNABLE.R
+
+User will copy and render locally in RStudio.

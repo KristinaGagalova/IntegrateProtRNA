@@ -13,6 +13,32 @@ Kristina Gagalova
   - [Verdict](#verdict)
 - [2b. UNRESOLVED — reconciliation with the standalone limma
   workflow](#b.-unresolved-reconciliation-with-the-standalone-limma-workflow)
+
+## Publication Strategy — What Can Be Claimed
+
+Based on the findings above, here is the framework for preparing this analysis for publication:
+
+### **SHOWSTOPPERS** — Must Address Before Publishing
+
+1. **B4 — RNA Measurement Uncertainty (§7):** RNA error flips regulated/not-regulated calls for 36–49% of genes. Individual per-gene targets are unstable without propagating RNA uncertainty or orthogonal validation.
+
+2. **A1 — Model Shape Mismatch (§3):** First-order kinetics are systematically violated with opposite residual bias between varieties.
+
+3. **Reconciliation — DE Count Discrepancy (§2b):** This pipeline reports 2–6× fewer DE genes than standalone limma. Cause unresolved.
+
+### **MANAGEABLE** — Publish With Caveats
+
+- **Identifiability (§5):** Only 23–27% of genes fit in resolvable half-life band.
+- **A0 — Baseline (§2):** Cadenza clean (0.4%); Norin anomalous (5.8%).
+- **B5 — Gene Correlation (§8):** Aggregate estimates remain robust.
+
+### **ROBUST** — Already Validated
+
+- MNAR dominance (Spearman ρ = −0.74) ✓
+- Horseshoe prior scale ✓
+- MCMC convergence ✓
+
+---
   - [The assumption](#the-assumption-1)
   - [The test](#the-test-1)
   - [Verdict: DISCREPANCY, unresolved](#verdict-discrepancy-unresolved)
