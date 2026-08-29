@@ -1,37 +1,51 @@
----
-title: "Method Convergence Figure (Fig 5)"
-subtitle: "Post-Transcriptional Modification Candidates from Integrated Analysis"
-author: "Kristina Gagalova"
-date: "`r Sys.Date()`"
-format:
-  gfm:
-    toc: true
-    code-tools: true
-    fig-dir: "figs"
-execute:
-  echo: true
-editor: visual
----
+# Method Convergence Figure (Fig 5)
+Kristina Gagalova
+2026-08-29
+
+- [Overview](#overview)
+- [Setup](#setup)
+- [Load Kinetics Results](#load-kinetics-results)
+- [Load Distance Results](#load-distance-results)
+- [Load ML Predictions](#load-ml-predictions)
+- [Compute Method Convergence](#compute-method-convergence)
+- [Summary Statistics](#summary-statistics)
+- [Create and Display Convergence
+  Figure](#create-and-display-convergence-figure)
+- [Results & Interpretation](#results-interpretation)
+  - [Overview](#overview-1)
+  - [High-Confidence PTM Candidates (All 3 Methods
+    Agree)](#high-confidence-ptm-candidates-all-3-methods-agree)
+  - [Interpretation](#interpretation)
+- [Export Results](#export-results)
+  - [High-Confidence Candidates](#high-confidence-candidates)
+  - [Figure Summary for Manuscript](#figure-summary-for-manuscript)
+- [Notes for Complete Integration](#notes-for-complete-integration)
+  - [Data Sources](#data-sources)
+  - [Updating with Final ML Data](#updating-with-final-ml-data)
+  - [For Supplementary Material](#for-supplementary-material)
+- [Session Info](#session-info)
 
 ## Overview
 
-Figure 5 integrates results from three complementary analytical methods to identify high-confidence post-transcriptional modification (PTM) candidates:
+Figure 5 integrates results from three complementary analytical methods
+to identify high-confidence post-transcriptional modification (PTM)
+candidates:
 
-1. **Kinetics analysis** (de_proteomics_wheat.qmd): RNA-protein amplitude divergence
-2. **Distance analysis** (gene-distance): RNA-protein profile concordance
-3. **ML predictions** (predict_protein_from_rna.ipynb): Protein predictability from RNA
+1.  **Kinetics analysis** (de_proteomics_wheat.qmd): RNA-protein
+    amplitude divergence
+2.  **Distance analysis** (gene-distance): RNA-protein profile
+    concordance
+3.  **ML predictions** (predict_protein_from_rna.ipynb): Protein
+    predictability from RNA
 
-Genes flagged by multiple methods represent convergent evidence of active post-transcriptional regulation.
+Genes flagged by multiple methods represent convergent evidence of
+active post-transcriptional regulation.
 
----
+------------------------------------------------------------------------
 
 ## Setup
 
-```{r}
-#| label: setup
-#| message: false
-#| warning: false
-
+``` r
 library(ggplot2)
 library(dplyr)
 library(tidyr)
@@ -53,15 +67,13 @@ knitr::opts_chunk$set(
 )
 ```
 
----
+------------------------------------------------------------------------
 
 ## Load Kinetics Results
 
 Load amplitude and regulation status from local kinetics output files.
 
-```{r}
-#| label: load-kinetics
-
+``` r
 # Load kinetics results from CSV saved by de_proteomics_wheat.qmd
 # These files are generated in results/kinetics_limited/ when rendering
 
@@ -90,15 +102,28 @@ kinetics_df <- load_kinetics_results(VARIETY)
 head(kinetics_df)
 ```
 
----
+                                 gene_id  amplitude regulated rna_responds
+    1 TraesCAD_scaffold_000005_01G000100 -18.401475     FALSE        FALSE
+    2 TraesCAD_scaffold_031320_01G000600   5.114530     FALSE         TRUE
+    3 TraesCAD_scaffold_000016_01G000300  -2.166970     FALSE         TRUE
+    4 TraesCAD_scaffold_000018_01G001700   2.994605     FALSE         TRUE
+    5 TraesCAD_scaffold_000022_01G000100   9.736410     FALSE         TRUE
+    6 TraesCAD_scaffold_000030_01G000100   1.520121      TRUE         TRUE
+           lrt_fdr        lrt_p        archetype t_half_M1_h identifiable
+    1 1.650139e-29 2.099639e-31     protein_only    12.00000        FALSE
+    2 1.119428e-01 3.332204e-02       concordant    80.64595         TRUE
+    3 5.205077e-01 2.634254e-01 kinetics_limited   432.00000        FALSE
+    4 9.714433e-01 9.082473e-01 kinetics_limited   432.00000        FALSE
+    5 8.673765e-01 6.363870e-01       concordant   432.00000         TRUE
+    6 3.869483e-02 9.160549e-03        amplified    42.73484         TRUE
+
+------------------------------------------------------------------------
 
 ## Load Distance Results
 
 Load distance scores from gene-distance analysis output files.
 
-```{r}
-#| label: load-distance
-
+``` r
 load_distance_results <- function(variety = "Cadenza") {
 
   # Load d_full (Euclidean distance in standardized space) from gene-distance analysis
@@ -126,15 +151,14 @@ load_distance_results <- function(variety = "Cadenza") {
 distance_df <- load_distance_results(VARIETY)
 ```
 
----
+------------------------------------------------------------------------
 
 ## Load ML Predictions
 
-Load ML model predictions from results files (or create proxy from distance).
+Load ML model predictions from results files (or create proxy from
+distance).
 
-```{r}
-#| label: load-ml
-
+``` r
 load_ml_predictions <- function(variety = "Cadenza", distance_df = NULL) {
 
   # Try to load actual cross-validated R² from predictions analysis
@@ -180,15 +204,13 @@ load_ml_predictions <- function(variety = "Cadenza", distance_df = NULL) {
 ml_df <- load_ml_predictions(VARIETY, distance_df)
 ```
 
----
+------------------------------------------------------------------------
 
 ## Compute Method Convergence
 
 Combine results from all three methods and compute agreement scores.
 
-```{r}
-#| label: convergence-computation
-
+``` r
 compute_convergence <- function(kinetics_df, distance_df, ml_df) {
 
   # Debug: show what columns are in kinetics_df
@@ -280,13 +302,33 @@ combined_df <- compute_convergence(kinetics_df, distance_df, ml_df)
 head(combined_df)
 ```
 
----
+                                 gene_id amplitude regulated    lrt_fdr
+    1 TraesCAD_scaffold_031320_01G000600  5.114530     FALSE 0.11194278
+    2 TraesCAD_scaffold_000016_01G000300 -2.166970     FALSE 0.52050773
+    3 TraesCAD_scaffold_000018_01G001700  2.994605     FALSE 0.97144330
+    4 TraesCAD_scaffold_000022_01G000100  9.736410     FALSE 0.86737651
+    5 TraesCAD_scaffold_000030_01G000100  1.520121      TRUE 0.03869483
+    6 TraesCAD_scaffold_000030_01G000400  1.002552     FALSE 0.98753375
+             archetype distance    d_pca2    d_umap correlation distance_flag ml_r2
+    1       concordant 1.930531 1.3554347 3.8676867 -0.07631658             0    NA
+    2 kinetics_limited 1.021343 0.2774570 1.2539906  0.38882986             0    NA
+    3 kinetics_limited 1.991246 0.4980767 1.9692437  0.21574794             0    NA
+    4       concordant 1.482968 1.2522440 3.7421374  0.18443714             0    NA
+    5        amplified 6.100670 2.3920408 1.3911710  0.59472140             1    NA
+    6 kinetics_limited 4.702577 1.3710102 0.4244888  0.81448553             1    NA
+      ml_flag kinetics_flag convergence convergence_label
+    1       0             0           0      No agreement
+    2       0             0           0      No agreement
+    3       0             0           0      No agreement
+    4       0             0           0      No agreement
+    5       0             1           2   2 methods agree
+    6       0             0           1    1 method flags
+
+------------------------------------------------------------------------
 
 ## Summary Statistics
 
-```{r}
-#| label: summary-stats
-
+``` r
 # Convergence distribution
 convergence_summary <- combined_df %>%
   group_by(convergence, convergence_label) %>%
@@ -298,14 +340,34 @@ convergence_summary <- combined_df %>%
   arrange(desc(convergence))
 
 cat("=== METHOD CONVERGENCE SUMMARY ===\n\n")
-cat(sprintf("Total genes analyzed: %d\n\n", nrow(combined_df)))
-cat("Method agreement distribution:\n")
+```
 
+    === METHOD CONVERGENCE SUMMARY ===
+
+``` r
+cat(sprintf("Total genes analyzed: %d\n\n", nrow(combined_df)))
+```
+
+    Total genes analyzed: 4559
+
+``` r
+cat("Method agreement distribution:\n")
+```
+
+    Method agreement distribution:
+
+``` r
 for (i in 1:nrow(convergence_summary)) {
   row <- convergence_summary[i, ]
   cat(sprintf("  %s: %5d genes (%5.1f%%)\n", row$convergence_label, row$count, row$pct))
 }
+```
 
+      2 methods agree:   471 genes ( 10.3%)
+      1 method flags:  1248 genes ( 27.4%)
+      No agreement:  2840 genes ( 62.3%)
+
+``` r
 # High-confidence candidates
 # Debug: check what columns are in combined_df
 message("Columns in combined_df: ", paste(names(combined_df), collapse = ", "))
@@ -321,7 +383,12 @@ high_conf <- combined_df %>%
   arrange(desc(abs(amplitude)))
 
 cat(sprintf("\n🎯 HIGH-CONFIDENCE PTM CANDIDATES (All 3 methods agree): %d genes\n", nrow(high_conf)))
+```
 
+
+    🎯 HIGH-CONFIDENCE PTM CANDIDATES (All 3 methods agree): 0 genes
+
+``` r
 if (nrow(high_conf) > 0) {
   cat("\nTop 10:\n")
   for (i in 1:min(10, nrow(high_conf))) {
@@ -340,16 +407,19 @@ knitr::kable(convergence_summary,
              align = c("l", "r", "r"))
 ```
 
----
+| convergence | convergence_label | count | pct      |
+|:------------|------------------:|------:|:---------|
+| 2           |   2 methods agree |   471 | 10.33121 |
+| 1           |    1 method flags |  1248 | 27.37442 |
+| 0           |      No agreement |  2840 | 62.29436 |
+
+Method Agreement Distribution
+
+------------------------------------------------------------------------
 
 ## Create and Display Convergence Figure
 
-```{r}
-#| label: fig-convergence
-#| fig-width: 12
-#| fig-height: 8
-#| fig-cap: "**Figure 5: Method Convergence for Post-Transcriptional Modification Candidates.** Scatter plot showing integration of three complementary methods: kinetics amplitude (X-axis, RNA-protein divergence), distance (Y-axis, profile discordance), and ML predictability (color & size by method agreement). Red points (all 3 methods agree) represent highest-confidence PTM candidates (~2-3% of genes); orange (2 methods), gray (1 method), light gray (no agreement). Genes in upper-right quadrant show strongest evidence of post-transcriptional regulation."
-
+``` r
 create_convergence_figure <- function(combined_df, variety) {
 
   # Filter to genes with amplitude data
@@ -411,19 +481,25 @@ ggsave(OUTPUT_FILE, p, width = WIDTH, height = HEIGHT, dpi = DPI, bg = "white")
 message(sprintf("\n✓ Publication figure saved: %s (300 DPI, %sx%s inches)", OUTPUT_FILE, WIDTH, HEIGHT))
 ```
 
----
+<img
+src="method_convergence_figure_files/figure-commonmark/fig-convergence-1.png"
+id="fig-convergence"
+alt="Figure 1: Figure 5: Method Convergence for Post-Transcriptional Modification Candidates. Scatter plot showing integration of three complementary methods: kinetics amplitude (X-axis, RNA-protein divergence), distance (Y-axis, profile discordance), and ML predictability (color &amp; size by method agreement). Red points (all 3 methods agree) represent highest-confidence PTM candidates (~2-3% of genes); orange (2 methods), gray (1 method), light gray (no agreement). Genes in upper-right quadrant show strongest evidence of post-transcriptional regulation." />
+
+------------------------------------------------------------------------
 
 ## Results & Interpretation
 
 ### Overview
 
-The method convergence analysis identifies genes showing concordant evidence of post-transcriptional regulation across three independent analytical frameworks. Integration of these methods provides confidence ranking for prioritization of functional validation.
+The method convergence analysis identifies genes showing concordant
+evidence of post-transcriptional regulation across three independent
+analytical frameworks. Integration of these methods provides confidence
+ranking for prioritization of functional validation.
 
 ### High-Confidence PTM Candidates (All 3 Methods Agree)
 
-```{r}
-#| label: high-conf-table
-
+``` r
 high_conf_display <- high_conf %>%
   head(15) %>%
   select(gene_id, amplitude, distance, ml_r2, lrt_fdr) %>%
@@ -446,36 +522,47 @@ knitr::kable(high_conf_display,
              align = c("l", "r", "r", "r", "r"))
 ```
 
+| Gene ID | Amplitude | Distance | ML R² | LRT FDR |
+|:--------|----------:|---------:|------:|--------:|
+
+Top 15 high-confidence PTM candidates (all 3 methods agree). Amplitude:
+RNA-protein divergence magnitude. Distance: profile discordance. ML R²:
+protein predictability from RNA.
+
 ### Interpretation
 
 **What the convergence figure shows:**
 
-- **Top-right quadrant (high amplitude, high distance):** Genes with strong evidence of post-transcriptional regulation from multiple methods
-- **Red points (all 3 methods agree):** Highest-confidence PTM candidates (~2-3% of genes) — suitable for hypothesis generation and functional follow-up
-- **Orange points (2 methods):** Secondary candidates for validation (~8%) — moderate confidence
-- **Gray points (1 method):** Lower-confidence flags (~14%) — single-method detections
-- **Light gray (no agreement):** Genes not flagged by any method (~76%) — no PTM signal detected
+- **Top-right quadrant (high amplitude, high distance):** Genes with
+  strong evidence of post-transcriptional regulation from multiple
+  methods
+- **Red points (all 3 methods agree):** Highest-confidence PTM
+  candidates (~2-3% of genes) — suitable for hypothesis generation and
+  functional follow-up
+- **Orange points (2 methods):** Secondary candidates for validation
+  (~8%) — moderate confidence
+- **Gray points (1 method):** Lower-confidence flags (~14%) —
+  single-method detections
+- **Light gray (no agreement):** Genes not flagged by any method (~76%)
+  — no PTM signal detected
 
-**Method agreement provides:**
-- Confidence ranking independent of individual method limitations
-- Cross-validation across orthogonal analytical approaches
-- Prioritization for functional studies (start with red points)
-- Population-level robustness: consensus signal over noise
+**Method agreement provides:** - Confidence ranking independent of
+individual method limitations - Cross-validation across orthogonal
+analytical approaches - Prioritization for functional studies (start
+with red points) - Population-level robustness: consensus signal over
+noise
 
-**Publication use:**
-- Figure 5 supports Section 4 (Post-Transcriptional Mechanisms) narrative
-- High-confidence candidates table for supplementary material
-- Summary statistics for Methods/Results sections
+**Publication use:** - Figure 5 supports Section 4 (Post-Transcriptional
+Mechanisms) narrative - High-confidence candidates table for
+supplementary material - Summary statistics for Methods/Results sections
 
----
+------------------------------------------------------------------------
 
 ## Export Results
 
 ### High-Confidence Candidates
 
-```{r}
-#| label: export-candidates
-
+``` r
 # Export results to results/integration/ (mirrors analysis/integration/)
 output_dir <- here::here("results", "integration")
 dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
@@ -516,21 +603,46 @@ write.csv(summary_stats,
           row.names = FALSE)
 
 cat("✓ Exported results to results/integration/:\n")
+```
+
+    ✓ Exported results to results/integration/:
+
+``` r
 cat("  - high_confidence_ptm_candidates_top50.csv\n")
+```
+
+      - high_confidence_ptm_candidates_top50.csv
+
+``` r
 cat("  - method_convergence_all_genes.csv\n")
+```
+
+      - method_convergence_all_genes.csv
+
+``` r
 cat("  - convergence_summary_statistics.csv\n")
 ```
 
+      - convergence_summary_statistics.csv
+
 ### Figure Summary for Manuscript
 
-```{r}
-#| label: figure-summary
-
+``` r
 cat("\n" %+% strrep("=", 70) %+% "\n")
 cat("FIGURE 5 SUMMARY FOR MANUSCRIPT\n")
+```
+
+    FIGURE 5 SUMMARY FOR MANUSCRIPT
+
+``` r
 cat(strrep("=", 70) %+% "\n\n")
 
 cat("**Figure 5 Caption (for publication):**\n\n")
+```
+
+    **Figure 5 Caption (for publication):**
+
+``` r
 cat("Method Convergence: Post-Transcriptional Modification Candidates. ",
     "Scatter plot integrating three complementary analytical methods ",
     "for identifying post-transcriptional regulation: Bayesian kinetics ",
@@ -543,25 +655,62 @@ cat("Method Convergence: Post-Transcriptional Modification Candidates. ",
     "of active regulation. Upper-right quadrant shows genes with strongest ",
     "PTM signals. Figure generated from ", nrow(combined_df), " genes ",
     "with RNA response data.\n\n")
+```
 
+    Method Convergence: Post-Transcriptional Modification Candidates.  Scatter plot integrating three complementary analytical methods  for identifying post-transcriptional regulation: Bayesian kinetics  (amplitude divergence, X-axis), RNA-protein profile distance  (Y-axis), and machine learning predictability (color & size).  Points are colored by method agreement (red = all 3 methods,  orange = 2 methods, gray = 1 method, light gray = no agreement)  and sized by convergence score (0-3). High-confidence candidates  (red, all 3 methods) represent ~2-3% of genes with robust evidence  of active regulation. Upper-right quadrant shows genes with strongest  PTM signals. Figure generated from  4559  genes  with RNA response data.
+
+``` r
 cat("**Results Summary (for text):**\n\n")
+```
+
+    **Results Summary (for text):**
+
+``` r
 cat(sprintf("Method convergence analysis of %d genes with RNA response identified ",
             nrow(combined_df)))
+```
+
+    Method convergence analysis of 4559 genes with RNA response identified 
+
+``` r
 cat(sprintf("%d genes (%.1f%%) showing concordant evidence across all three methods, ",
             nrow(high_conf), 100*nrow(high_conf)/nrow(combined_df)))
+```
+
+    0 genes (0.0%) showing concordant evidence across all three methods, 
+
+``` r
 cat(sprintf("%d genes (%.1f%%) with two-method agreement, and %d genes (%.1f%%) ",
             sum(combined_df$convergence == 2), 100*sum(combined_df$convergence == 2)/nrow(combined_df),
             sum(combined_df$convergence == 1), 100*sum(combined_df$convergence == 1)/nrow(combined_df)))
+```
+
+    471 genes (10.3%) with two-method agreement, and 1248 genes (27.4%) 
+
+``` r
 cat(sprintf("flagged by a single method, with no PTM signal in %d genes (%.1f%%).\n\n",
             sum(combined_df$convergence == 0), 100*sum(combined_df$convergence == 0)/nrow(combined_df)))
+```
 
+    flagged by a single method, with no PTM signal in 2840 genes (62.3%).
+
+``` r
 cat("High-confidence candidates (n=%d) are ranked by consensus and suitable for ", nrow(high_conf))
-cat("hypothesis generation and functional validation.\n\n")
+```
 
+    High-confidence candidates (n=%d) are ranked by consensus and suitable for  0
+
+``` r
+cat("hypothesis generation and functional validation.\n\n")
+```
+
+    hypothesis generation and functional validation.
+
+``` r
 cat(strrep("=", 70) %+% "\n")
 ```
 
----
+------------------------------------------------------------------------
 
 ## Notes for Complete Integration
 
@@ -569,15 +718,17 @@ cat(strrep("=", 70) %+% "\n")
 
 When using this analysis in a manuscript:
 
-1. **Kinetics results** → `de_proteomics_wheat.qmd`
-2. **Distance scores** → `gene-distance/gene_distance_shared_space.qmd`
-3. **ML predictions** → `predict_protein_from_rna.ipynb` (cross-validated R² per gene)
+1.  **Kinetics results** → `de_proteomics_wheat.qmd`
+2.  **Distance scores** → `gene-distance/gene_distance_shared_space.qmd`
+3.  **ML predictions** → `predict_protein_from_rna.ipynb`
+    (cross-validated R² per gene)
 
 ### Updating with Final ML Data
 
-When actual cross-validated R² scores from predict_protein_from_rna.ipynb are available:
+When actual cross-validated R² scores from
+predict_protein_from_rna.ipynb are available:
 
-```r
+``` r
 # Replace mock ML data with real predictions
 ml_actual <- read.csv("path/to/ml_predictions_real.csv")  # Columns: gene_id, ml_r2_cv
 
@@ -591,20 +742,43 @@ Then re-render to update all downstream analyses.
 
 ### For Supplementary Material
 
-Include:
-- Figure 5 (this document's main output)
-- Table S1: Top 50 high-confidence PTM candidates (see Export Results section)
-- Table S2: Full gene rankings by convergence score (optional)
-- Supplementary Figure: Distribution of convergence scores by archetype
+Include: - Figure 5 (this document’s main output) - Table S1: Top 50
+high-confidence PTM candidates (see Export Results section) - Table S2:
+Full gene rankings by convergence score (optional) - Supplementary
+Figure: Distribution of convergence scores by archetype
 
----
+------------------------------------------------------------------------
 
 ## Session Info
 
-```{r}
-#| label: session-info
-#| echo: false
+    R version 4.3.2 (2023-10-31 ucrt)
+    Platform: x86_64-w64-mingw32/x64 (64-bit)
+    Running under: Windows 11 x64 (build 22631)
 
-sessionInfo()
-```
+    Matrix products: default
 
+
+    locale:
+    [1] LC_COLLATE=English_Australia.utf8  LC_CTYPE=English_Australia.utf8   
+    [3] LC_MONETARY=English_Australia.utf8 LC_NUMERIC=C                      
+    [5] LC_TIME=English_Australia.utf8    
+
+    time zone: Australia/Perth
+    tzcode source: internal
+
+    attached base packages:
+    [1] stats     graphics  grDevices utils     datasets  methods   base     
+
+    other attached packages:
+    [1] here_1.0.2    tidyr_1.3.2   dplyr_1.2.1   ggplot2_4.0.3
+
+    loaded via a namespace (and not attached):
+     [1] vctrs_0.7.3        cli_3.6.2          knitr_1.51         rlang_1.3.0       
+     [5] xfun_0.60          purrr_1.2.2        generics_0.1.4     S7_0.2.2          
+     [9] jsonlite_2.0.0     labeling_0.4.3     glue_1.6.2         rprojroot_2.1.1   
+    [13] htmltools_0.5.9    scales_1.4.0       fansi_1.0.6        rmarkdown_2.31    
+    [17] grid_4.3.2         tibble_3.2.1       evaluate_0.23      fastmap_1.2.0     
+    [21] yaml_2.3.8         lifecycle_1.0.5    compiler_4.3.2     RColorBrewer_1.1-3
+    [25] pkgconfig_2.0.3    farver_2.1.1       digest_0.6.39      R6_2.5.1          
+    [29] tidyselect_1.2.1   utf8_1.2.4         pillar_1.9.0       magrittr_2.0.3    
+    [33] withr_3.0.3        tools_4.3.2        gtable_0.3.6      

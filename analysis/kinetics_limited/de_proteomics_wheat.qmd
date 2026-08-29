@@ -1549,3 +1549,63 @@ Ordered by how much they would change what can be claimed:
 4.  **Orthogonally validate 5--10 targets** (PRM / western / qPCR).
 5.  `docs/planning.md` S10 (functional enrichment) --- run it on the kinetic archetypes, which passed their validation, rather than on the trajectory clusters, which did not.
 6.  `docs/planning.md` §4B--4E remain unbuilt; evaluate against the existing `rnaprot/` codebase on `nectar` first (see project memory `proj_existing_nectar_rnaprot.md`).
+
+------------------------------------------------------------------------
+
+## 12. Export kinetics results for integration analysis
+
+Export kinetics results to CSV for use by method_convergence_figure.qmd and other downstream analyses.
+
+```{r}
+#| label: export-kinetics-results
+
+# Export kinetics results to CSV in results/kinetics_limited/
+output_dir <- here::here("results", "kinetics_limited")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Export Cadenza kinetics results
+if (exists("cad_arch")) {
+  cad_kinetics_export <- data.frame(
+    gene_id = cad_arch$gene_id,
+    amplitude = cad_arch$amplitude_a,
+    regulated = cad_arch$regulated,
+    rna_responds = cad_arch$rna_responds,
+    lrt_fdr = cad_arch$lrt_fdr,
+    lrt_p = cad_arch$lrt_p,
+    archetype = cad_arch$archetype,
+    t_half_M1_h = cad_arch$t_half_M1_h,
+    identifiable = cad_arch$identifiable,
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(cad_kinetics_export,
+            file.path(output_dir, "kinetics_results_cadenza.csv"),
+            row.names = FALSE)
+
+  cat("✓ Exported Cadenza kinetics to: results/kinetics_limited/kinetics_results_cadenza.csv\n")
+}
+
+# Export Norin kinetics results
+if (exists("nor_arch")) {
+  nor_kinetics_export <- data.frame(
+    gene_id = nor_arch$gene_id,
+    amplitude = nor_arch$amplitude_a,
+    regulated = nor_arch$regulated,
+    rna_responds = nor_arch$rna_responds,
+    lrt_fdr = nor_arch$lrt_fdr,
+    lrt_p = nor_arch$lrt_p,
+    archetype = nor_arch$archetype,
+    t_half_M1_h = nor_arch$t_half_M1_h,
+    identifiable = nor_arch$identifiable,
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(nor_kinetics_export,
+            file.path(output_dir, "kinetics_results_norin.csv"),
+            row.names = FALSE)
+
+  cat("✓ Exported Norin kinetics to: results/kinetics_limited/kinetics_results_norin.csv\n")
+}
+
+cat("\nKinetics results ready for method_convergence_figure.qmd\n")
+```
