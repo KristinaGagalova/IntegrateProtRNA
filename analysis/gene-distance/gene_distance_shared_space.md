@@ -178,6 +178,8 @@ cad <- prepare_variety("cadenza", DESIGN)
     Done cluster 1164 
     Done cluster 2239 
 
+    Validated DE (Cadenza): 59931 genes x 4 timepoints
+
 ``` r
 nor <- prepare_variety("norin",   DESIGN)
 ```
@@ -197,6 +199,8 @@ nor <- prepare_variety("norin",   DESIGN)
     Done cluster 2489 
     Done cluster 1213 
     Done cluster 3702 
+
+    Validated DE (Norin): 59502 genes x 4 timepoints
 
 ``` r
 REAL <- list(Cadenza = cad, Norin = nor)

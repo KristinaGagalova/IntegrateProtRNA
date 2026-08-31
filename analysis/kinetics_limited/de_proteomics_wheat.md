@@ -465,6 +465,13 @@ run_qc_rna <- function(counts, meta) {
 #' quantified" (standard LFQ-intensity convention), not a true biological
 #' zero -- it becomes NA before the validity filter and normalisation.
 run_qc_prot <- function(intensity, meta, min_valid_in_cell = 2) {
+  ## Sample columns must be in metadata row order -- limma matches design-matrix
+  ## ROWS to expression-matrix COLUMNS positionally, and the cell indexing is
+  ## positional too, so a mismatch mislabels every sample silently. Not
+  ## hypothetical: as stored on disk, 3 of the 4 real matrices are in a
+  ## different order from their metadata. load_variety() reorders by name.
+  stopifnot(identical(colnames(intensity), rownames(meta)))
+
 
   # Zero means "not quantified", not a biological zero
   m <- intensity
@@ -506,6 +513,13 @@ run_qc_prot <- function(intensity, meta, min_valid_in_cell = 2) {
 #' this scale), but the up-front validity filter (>=2 valid in >=1 cell)
 #' keeps the imputation from manufacturing pure noise.
 run_missingness <- function(prot_norm, meta) {
+  ## Sample columns must be in metadata row order -- limma matches design-matrix
+  ## ROWS to expression-matrix COLUMNS positionally, and the cell indexing is
+  ## positional too, so a mismatch mislabels every sample silently. Not
+  ## hypothetical: as stored on disk, 3 of the 4 real matrices are in a
+  ## different order from their metadata. load_variety() reorders by name.
+  stopifnot(identical(colnames(prot_norm), rownames(meta)))
+
   cells <- levels(meta$cell)
   is_na <- is.na(prot_norm)
   n_obs_cell <- vapply(cells, function(cl)
@@ -542,6 +556,13 @@ run_missingness <- function(prot_norm, meta) {
 #' any-effect F-test. limma is used for both RNA (voom) and protein (trend +
 #' robust eBayes) so effect sizes are on a comparable scale.
 run_de <- function(mat, meta, is_rna) {
+  ## Sample columns must be in metadata row order -- limma matches design-matrix
+  ## ROWS to expression-matrix COLUMNS positionally, and the cell indexing is
+  ## positional too, so a mismatch mislabels every sample silently. Not
+  ## hypothetical: as stored on disk, 3 of the 4 real matrices are in a
+  ## different order from their metadata. load_variety() reorders by name.
+  stopifnot(identical(colnames(mat), rownames(meta)))
+
   ## Treatment-contrast parameterisation (~treatment*time), matching your
   ## limma workflow, in place of the ~0+cell design used before. The two are
   ## equivalent full-rank codings of the same means model: the per-timepoint
