@@ -17,6 +17,7 @@
 ## =============================================================================
 
 source(here::here("R", "utils.R"))
+source(here::here("R", "load_validated_de.R"))
 
 # ---------------------------------------------------------------------------
 # Design constants
@@ -340,9 +341,25 @@ prepare_variety <- function(prefix, design, seed = 1) {
   qp <- run_qc_prot(v$prot, v$meta)
   mi <- run_missingness(qp$norm, v$meta)
 
-  de_rna <- run_de(qr$counts, v$meta, design, is_rna = TRUE)
+  ## RNA treatment contrasts come from the project's validated standalone limma
+  ## workflow, not from re-deriving them here -- see R/load_validated_de.R for
+  ## why (resolves the 2--6x disagreement recorded in assumptions_validation.qmd
+  ## 2b). The local fit is still run, but ONLY for `ctrl_time`: the control-arm
+  ## time coefficients, which the standalone workflow does not export and the A3
+  ## diagnostic needs. Those are least-squares point estimates, and the 2b
+  ## disagreement was in the standard errors / variance moderation, which does
+  ## not affect coefficients -- so mixing them is legitimate.
+  de_rna <- load_validated_de(
+    variety    = paste0(toupper(substring(prefix, 1, 1)), substring(prefix, 2)),
+    timepoints = design$timepoints)
+  de_rna$ctrl_time <- run_de(qr$counts, v$meta, design, is_rna = TRUE)$ctrl_time
 
-  common  <- intersect(rownames(mi$mixed), rownames(qr$counts))
+  ## Universe B must also be restricted to genes the validated DE contains.
+  ## Without the third term, indexing by `common` silently injects all-NA rows
+  ## for genes the standalone workflow filtered out.
+  common  <- Reduce(intersect, list(rownames(mi$mixed),
+                                    rownames(qr$counts),
+                                    rownames(de_rna$lfc)))
   de_prot <- run_de(mi$mixed[common, , drop = FALSE], v$meta, design,
                     is_rna = FALSE)
 

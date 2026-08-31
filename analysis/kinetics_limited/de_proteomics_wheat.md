@@ -14,6 +14,8 @@ Kristina Gagalova
   - [1. Setup](#setup)
   - [2. Loading and QC (reusable
     functions)](#loading-and-qc-reusable-functions)
+  - [2c. RNA DE from the validated standalone
+    workflow](#c.-rna-de-from-the-validated-standalone-workflow)
   - [3. Kinetic archetype classification
     (profile-likelihood)](#kinetic-archetype-classification-profile-likelihood)
     - [Kinetic Modeling of Transcriptome & Proteome
@@ -128,8 +130,8 @@ has never seen, it predicts that cell’s proteome better than chance.
 
 | Variety | Q² (1 component) | permutation p |
 |:--------|:-----------------|:--------------|
-| Cadenza | **0.269**        | 0.010         |
-| Norin   | **0.084**        | 0.020         |
+| Cadenza | **0.269**        | 0.015         |
+| Norin   | **0.084**        | 0.045         |
 
 This is the most robust result in the project. It cannot be inflated by
 the in-sample correlation artefact that makes naive cross-block
@@ -137,27 +139,43 @@ correlation meaningless at this sample size (a PLS on 8 pseudo-samples
 reaches r ≈ 0.72 on *permuted* data), because Q² is computed on held-out
 cells.
 
-**2. Post-transcriptional regulation is present, and its magnitude is
-larger than measurement error alone explains.**
+**2. Protein trajectories depart from a fixed-rate, RNA-only reference
+model more often than an independent-error null predicts.**
 
-A substantial fraction of RNA-responsive genes have protein trajectories
-that depart from what their own transcript trajectory predicts under
-first-order kinetics. This holds in both varieties, analysed
+Roughly 23% of RNA-responsive genes reject the kinetic null in both
+varieties (Cadenza 1,050 / 4,559; Norin 896 / 3,796), analysed
 independently.
 
+**This is deliberately not worded as evidence for post-transcriptional
+regulation, and it should not be.** The null omits several features that
+are demonstrably present in these data — control-arm drift (§8b),
+structured trajectory-shape error (`assumptions_validation.qmd` §3),
+unpropagated RNA uncertainty, and correlated residuals across genes
+(residual PC1 62–69% vs ~25% expected). Any of those produces departures
+from a fixed-rate independent-error null *with no post-transcriptional
+regulation present*, so the null is not the right comparator for a
+mechanistic claim. Report these as **transcript–protein discordance**;
+see `manuscript_support_report.md` §4 for the wording to use.
+
 **3. The two varieties differ, and Cadenza is the better-behaved
-dataset.** Cadenza has a clean baseline (0.4% of genes differentially
-expressed at 0 hpi, when infection cannot yet have acted), higher
-predictive coupling, and no significant association between control-arm
-drift and regulation calls. Norin fails all three (5.8% baseline DE; Q²
-= 0.084; drift OR 1.31, p \< 1e-15). Where they disagree, weight
-Cadenza.
+dataset.** Cadenza has a clean baseline (**0.72%** of genes
+differentially expressed at 0 hpi, when infection cannot yet have
+acted), higher predictive coupling, and no significant association
+between control-arm drift and regulation calls. Norin fails all three
+(**17.6%** baseline DE; Q² = 0.084; drift OR 1.32, 95% CI 1.20–1.44, p
+\< 1e-15). Where they disagree, weight Cadenza.
+
+That baseline asymmetry is **24-fold** and is the single largest problem
+in the dataset. It also undercuts the justification for t0-centring in
+Norin specifically: `Rl <- Rl - Rl[, 1]` is defended below as removing a
+batch artefact, but at 17.6% DE the Norin baseline contrast is carrying
+substantial real signal, and centring subtracts it.
 
 **4. Independent analyses of the two varieties agree on orthologous
-genes above chance** (χ² = 88.2, p = 3.7e-15 for archetype agreement).
-The effect is modest (Cramér’s V = 0.14) but it cannot be an artefact of
-the procedure — the varieties share no samples and were processed
-separately.
+genes above chance** (χ² = 727.7, df = 42, p \< 2e-16 for archetype
+agreement across 2,505 testable ortholog pairs). The effect is modest
+(Cramér’s V = 0.220) but it cannot be an artefact of the procedure — the
+varieties share no samples and were processed separately.
 
 ## What this analysis does *not* establish
 
@@ -170,17 +188,38 @@ None of that uncertainty appears in the reported credible intervals.
 Treat any named gene as a hypothesis requiring orthogonal validation
 (PRM, western, qPCR).
 
-**The count of regulated genes is soft.** It moves 3× across plausible
-measurement-error assumptions (1457 → 902 → 488 as protein SEs are
-scaled 0.67× → 1× → 1.5×), ~30% across imputation scheme, and 25% from
-the MCMC convergence fix alone. Always quote it with its settings.
+**The count of regulated genes is soft.** On the current settings the
+profile-likelihood LRT calls 951 / 4,300 RNA-responsive Cadenza genes
+regulated, and the hierarchical model 1,913 / 4,300 — the two differ
+two-fold on identical input, and most of that gap is uncertainty the
+hierarchical model removes by conditioning on a fixed half-life, not
+extra evidence. The count also moves ~30% across imputation scheme and
+25% from the MCMC convergence fix alone. Always quote it with its
+settings.
 
-**Half-lives are mostly unresolvable.** Only **23–27%** of fitted genes
-fall in the band this design can estimate; ~50% sit above the 72 h
-identifiability bound and ~24% at the 12 h grid floor. A reported
-`t_half` of 12 h means “≤ 12 h”; above 72 h means “slower than we can
-see”. **The fitted `t_half` distribution is a property of the sampling
-window, not of the wheat proteome.**
+> The protein-SE scaling sensitivity (previously quoted as 1457 → 902 →
+> 488 across 0.67× → 1× → 1.5×) was computed under the superseded RNA DE
+> and has **not** been re-run against the validated DE. Do not quote
+> those three numbers until `assumptions_validation.qmd` is re-rendered.
+
+**Half-lives are mostly unresolvable, more so than earlier drafts
+stated.** Cross-tabulating the `identifiable` flag against where each
+fit actually landed on the half-life grid:
+
+|                                                 | Cadenza (n = 5,580) | Norin (n = 5,159) |
+|:------------------------------------------------|--------------------:|------------------:|
+| Not identifiable                                |       2,732 (49.0%) |     2,651 (51.4%) |
+| Identifiable, but pinned at the 12 h grid floor |       1,304 (23.4%) |       908 (17.6%) |
+| **Identifiable and inside the resolvable band** |      **392 (7.0%)** |   **643 (12.5%)** |
+| Fit landed above the 72 h bound                 |       2,376 (42.6%) |     1,952 (37.8%) |
+
+A fit at the grid floor means “≤ 12 h”, not “12 h” — it is censored, and
+counting it as identifiable is what produced the **23–27%** figure
+quoted in earlier drafts. Only **7% of Cadenza and 13% of Norin** genes
+have a half-life this design actually resolves. A reported `t_half`
+above 72 h means “slower than we can see”. **The fitted `t_half`
+distribution is a property of the sampling window, not of the wheat
+proteome.**
 
 **Mechanism cannot be assigned.** The amplitude parameter `a` conflates
 changed translation with changed degradation — absolute `k_s` cancels
@@ -189,53 +228,76 @@ data (derivation in “Where the Kinetic Null Comes From”, below). Write
 “departs from its RNA-predicted trajectory”, never “translationally
 repressed”.
 
-**Raw DE counts are pending reconciliation.** This pipeline reports 2–6×
-fewer differentially expressed genes than the project’s standalone limma
-workflow on counts that match exactly (see `assumptions_validation.qmd`
-§2b). Until that is resolved, no DE count from either source should be
-published.
+**The RNA-responsive gate is more permissive than it was.** The
+standalone workflow exports no omnibus F-statistic, so the gate is now
+the minimum BH-adjusted p across the four timepoint contrasts (paired,
+as before, with \|log2FC\| \> 0.5). A min-of-adjusted-p is
+anti-conservative relative to the F-test used previously, so the
+responsive set is larger for reasons independent of the DE change
+itself. This must be disclosed in Methods. It is reversible — the F-test
+gate can be taken from the local fit exactly as `ctrl_time` now is.
 
 ## Assumption status
 
-| Assumption                 | Status                | Evidence                                   |
-|:---------------------------|:----------------------|:-------------------------------------------|
-| MNAR-dominant missingness  | **Holds**             | Spearman −0.74 / −0.75                     |
-| Horseshoe prior scale      | **Holds**             | Insensitive, `p0_frac` 0.05–0.40           |
-| MCMC convergence           | **Holds**             | 0% R-hat \> 1.05, ESS ≈ 1600               |
-| Protein variance known     | Partly                | Amplitude invariant; call count varies 3×  |
-| A0 baseline equivalence    | **Asymmetric**        | Cadenza 0.4%, Norin 5.8% at 0 hpi          |
-| A3 control at steady state | **Violated**          | Median control drift ≈ 0.67 log2FC         |
-| A1 first-order kinetics    | **Violated**          | Structured residuals, opposite per variety |
-| B5 gene independence       | **Violated**          | Residual PC1 62–69% vs 25% expected        |
-| B4 RNA known exactly       | **Severely violated** | 36% / 49% of calls flip                    |
-| DE reconciliation          | **Unresolved**        | 2–6× disagreement, cause unknown           |
+| Assumption                      | Status                  | Evidence                                    |
+|:--------------------------------|:------------------------|:--------------------------------------------|
+| Abundance-dependent missingness | **Holds**               | Spearman −0.74 / −0.75                      |
+| Horseshoe prior scale           | **Holds**               | Insensitive, `p0_frac` 0.05–0.40            |
+| MCMC convergence                | **Holds**               | 0% R-hat \> 1.05, ESS ≈ 1600                |
+| DE reconciliation               | **Resolved**            | Validated standalone DE adopted; see §2c    |
+| Protein variance known          | Partly                  | Amplitude invariant; sensitivity re-run due |
+| Every missing cell is MNAR      | **Not established**     | Abundance-dependence ≠ per-cell MNAR        |
+| A0 baseline equivalence         | **Severely asymmetric** | Cadenza 0.72%, **Norin 17.6%** at 0 hpi     |
+| A3 control at steady state      | **Violated**            | Median control drift ≈ 0.67 log2FC          |
+| A1 first-order kinetics         | **Violated**            | Structured residuals, opposite per variety  |
+| B5 gene independence            | **Violated**            | Residual PC1 62–69% vs 25% expected         |
+| B4 RNA known exactly            | **Severely violated**   | 36% / 49% of calls flip                     |
+| LRT null is well-calibrated     | **Not established**     | χ² approx. ignores grid selection; §5 R3    |
 
 ## Recommended framing for the manuscript
 
-> Integrating unpaired transcriptome and proteome time courses at the
-> design-cell level, we find statistically significant predictive
-> coupling between the two layers (leave-one-cell-out Q² = 0.27,
-> permutation p = 0.01 in Cadenza), and evidence that a substantial
-> fraction of the proteome departs from transcript-predicted
-> trajectories. Because the design provides three biological replicates
-> and four timepoints over 72 h, and because RNA measurement error is
-> not propagated into the kinetic model, these findings support
-> population-level conclusions about the extent of post-transcriptional
-> regulation but do not support confident per-gene classification;
-> individual candidates require orthogonal validation.
+> We integrated unpaired transcriptome and proteome measurements at the
+> treatment-by-timepoint design-cell level. RNA trajectories predicted
+> held-out protein trajectories better than a permutation null
+> (leave-one-cell-out Q² = 0.27, permutation p = 0.015 in Cadenza),
+> indicating reproducible cross-omic association at the population
+> level. However, protein trajectories frequently departed from a
+> fixed-rate first-order RNA-predicted model, and these departures were
+> sensitive to control-arm drift, missing-value handling, and
+> uncertainty in the RNA trajectories. We therefore interpret the
+> results as evidence for transcript–protein discordance and regulation
+> beyond transcript abundance, rather than as direct estimates of
+> protein turnover, translation, or degradation. Individual candidates
+> should be treated as hypotheses requiring orthogonal validation.
+
+See `manuscript_support_report.md` for the full claim-by-claim wording
+table, the revisions required before submission, and the supporting
+literature.
 
 ## What would most improve this
 
-1.  **Resolve the DE reconciliation** (`assumptions_validation.qmd` §2b)
-    — upstream of everything, and a bug hunt rather than a modelling
-    question.
-2.  **Propagate RNA uncertainty** into the kinetic model — converts
-    per-gene calls from unusable to usable; the single highest-value
-    fix.
-3.  **Investigate Norin’s 0 hpi baseline** — plausibly upstream of
-    Norin’s other anomalies.
-4.  **Orthogonally validate 5–10 targets** — the only route to a
+1.  **Investigate Norin’s 0 hpi baseline** — at 17.6% DE before
+    infection can have acted, this is now the largest single problem in
+    the dataset, and it is upstream of Norin’s other anomalies. It also
+    determines whether t0-centring is defensible in that variety.
+2.  **Make the kinetic null control-aware** — fit the infected and
+    control arms jointly, or add a time-varying baseline term. The
+    measured drift violates the steady-state assumption the ratio model
+    rests on; this is the change that would most strengthen claim 2.
+3.  **Replace the analytic LRT with a parametric bootstrap** that
+    repeats the full fit, grid selection included, and propagates RNA
+    uncertainty, protein uncertainty, timepoint covariance and
+    imputation.
+4.  **Propagate RNA uncertainty** into the kinetic model — converts
+    per-gene calls from unusable to usable.
+5.  **Orthogonally validate 5–10 targets** — the only route to a
     publishable gene-level claim given the above.
+
+> **Done:** the DE reconciliation (`assumptions_validation.qmd` §2b) is
+> resolved — the RNA treatment contrasts are now read from the project’s
+> standalone limma workflow rather than re-derived here, so there is one
+> RNA DE result in the project rather than two that disagreed 2–6×. See
+> §2c.
 
 ------------------------------------------------------------------------
 
@@ -546,6 +608,37 @@ run_de <- function(mat, meta, is_rna) {
        ctrl_time = ctrl_time)
 }
 ```
+
+------------------------------------------------------------------------
+
+## 2c. RNA DE from the validated standalone workflow
+
+`run_de()` above is retained for the protein layer and for the
+control-arm time coefficients, but the **RNA treatment contrasts are
+taken from the project’s standalone limma workflow**
+(`norinXcadenza-shared`, `DE-varieties-limma`) rather than re-derived
+here. That workflow is the one whose numbers appear elsewhere in the
+project, and re-deriving them here produced the 2–6× disagreement
+documented in `assumptions_validation.qmd` §2b. Reading its published
+per-timepoint contrasts removes the disagreement by construction: there
+is now one RNA DE result in the project, not two.
+
+Two things the standalone CSVs do not carry, and how each is handled:
+
+- **Standard errors** are recovered as `|logFC / t|`, which is exact —
+  `t` is defined as `logFC / SE`, so this inverts it losslessly.
+- **An omnibus F-test** is not exported, so the RNA-responsive gate uses
+  the minimum BH-adjusted p across the four timepoint contrasts instead.
+  This is more permissive than the F-test and is noted at the call site.
+
+``` r
+## The loader lives in R/load_validated_de.R so that this notebook and
+## prepare_variety() (used by every other analysis/ notebook) share one
+## definition rather than two copies that can drift apart.
+source(here::here("R", "load_validated_de.R"))
+```
+
+------------------------------------------------------------------------
 
 ## 3. Kinetic archetype classification (profile-likelihood)
 
@@ -1153,8 +1246,28 @@ cat(sprintf("MNAR: %.1f%%  MAR: %.1f%%  (of all entries)\n",
 ## protein_id == gene_id within a variety (verified in ../../data/real/
 ## *_protein_gene_mapping.csv), so Universe B == QC'd protein genes that also
 ## survive RNA QC -- no bipartite mapping ambiguity for this dataset.
-cad_de_rna  <- run_de(cad_qc_r$counts, cad$meta, TRUE)
-cad_common  <- intersect(rownames(cad_mi$mixed), rownames(cad_qc_r$counts))
+## RNA DE: use the VALIDATED standalone limma results (§2b resolution) for the
+## treatment contrasts, rather than re-deriving them here.
+cad_de_rna <- load_validated_de("Cadenza")
+```
+
+    Validated DE (Cadenza): 59931 genes x 4 timepoints
+
+``` r
+## The A3 diagnostic needs the CONTROL-arm time coefficients, which the
+## standalone workflow does not export. Those are point estimates (the bare
+## `time_fX` coefficients), not tests -- the §2b discrepancy is in the standard
+## errors / variance moderation, which does not affect least-squares
+## coefficients -- so taking them from the local fit is legitimate. Nothing
+## else from this fit is used.
+cad_de_rna$ctrl_time <- run_de(cad_qc_r$counts, cad$meta, TRUE)$ctrl_time
+
+## Universe B must also be restricted to genes the validated DE actually
+## contains; without this, indexing by `cad_common` silently injects all-NA
+## rows for genes the standalone workflow filtered out.
+cad_common  <- Reduce(intersect, list(rownames(cad_mi$mixed),
+                                      rownames(cad_qc_r$counts),
+                                      rownames(cad_de_rna$lfc)))
 cad_de_prot <- run_de(cad_mi$mixed[cad_common, , drop = FALSE], cad$meta, FALSE)
 
 cat(sprintf("Universe B: %d matched genes\n", length(cad_common)))
@@ -1163,10 +1276,10 @@ cat(sprintf("Universe B: %d matched genes\n", length(cad_common)))
     Universe B: 5580 matched genes
 
 ``` r
-cat(sprintf("RNA any-effect FDR<0.05: %d\n",  sum(cad_de_rna$any_fdr[cad_common] < 0.05)))
+cat(sprintf("RNA any-effect FDR<0.05: %d\n", sum(cad_de_rna$any_fdr[cad_common] < 0.05)))
 ```
 
-    RNA any-effect FDR<0.05: 4699
+    RNA any-effect FDR<0.05: 4888
 
 ``` r
 cat(sprintf("Protein any-effect FDR<0.05: %d\n", sum(cad_de_prot$any_fdr < 0.05)))
@@ -1222,7 +1335,7 @@ cat(sprintf("RNA-responsive, eligible for amplitude fitting: %d / %d\n",
            sum(cad_rna_resp), length(cad_rna_resp)))
 ```
 
-    RNA-responsive, eligible for amplitude fitting: 4228 / 5580
+    RNA-responsive, eligible for amplitude fitting: 4300 / 5580
 
 ``` r
 cad_fit <- fit_hierarchical_kinetics(
@@ -1245,14 +1358,14 @@ cat(sprintf("Genes at the numerical safety bound (report as directional, not exa
            sum(cad_fit$summary$at_bound), nrow(cad_fit$summary)))
 ```
 
-    Genes at the numerical safety bound (report as directional, not exact): 168 / 4228
+    Genes at the numerical safety bound (report as directional, not exact): 176 / 4300
 
 ``` r
 cat(sprintf("Regulated by hierarchical model (95%% CI excludes a=1): %d / %d\n",
            sum(cad_fit$summary$regulated_95), nrow(cad_fit$summary)))
 ```
 
-    Regulated by hierarchical model (95% CI excludes a=1): 1908 / 4228
+    Regulated by hierarchical model (95% CI excludes a=1): 1913 / 4300
 
 ``` r
 cat(sprintf("Regulated by profile-likelihood LRT (FDR<0.05), same genes: %d / %d\n",
@@ -1260,7 +1373,7 @@ cat(sprintf("Regulated by profile-likelihood LRT (FDR<0.05), same genes: %d / %d
            sum(cad_rna_resp)))
 ```
 
-    Regulated by profile-likelihood LRT (FDR<0.05), same genes: 929 / 4228
+    Regulated by profile-likelihood LRT (FDR<0.05), same genes: 951 / 4300
 
 ``` r
 idx <- match(cad_fit$summary$gene_id, cad_arch$gene_id)
@@ -1301,10 +1414,10 @@ knitr::kable(as.data.frame(table(LRT = cad_kin$lrt_regulated, Bayesian = cad_kin
 
 | LRT   | Bayesian | Freq |
 |:------|:---------|-----:|
-| FALSE | FALSE    | 2217 |
-| TRUE  | FALSE    |  103 |
-| FALSE | TRUE     | 1082 |
-| TRUE  | TRUE     |  826 |
+| FALSE | FALSE    | 2266 |
+| TRUE  | FALSE    |  121 |
+| FALSE | TRUE     | 1083 |
+| TRUE  | TRUE     |  830 |
 
 Cadenza: agreement between the two regulation calls
 
@@ -1320,9 +1433,9 @@ knitr::kable(data.frame(component = seq_along(cad_int$q2), Q2 = round(cad_int$q2
 
 | component |    Q2 | perm_q95 | p_value |
 |----------:|------:|---------:|--------:|
-|         1 | 0.269 |    0.047 | 0.00995 |
-|         2 | 0.207 |    0.053 | 0.00498 |
-|         3 | 0.152 |   -0.120 | 0.00498 |
+|         1 | 0.269 |    0.095 | 0.01490 |
+|         2 | 0.207 |    0.057 | 0.00498 |
+|         3 | 0.152 |   -0.165 | 0.00498 |
 
 Cadenza: leave-one-cell-out Q2 vs permutation null
 
@@ -1395,8 +1508,19 @@ cat(sprintf("MNAR: %.1f%%  MAR: %.1f%%\n", 100 * nor_mi$mnar_frac, 100 * nor_mi$
     MNAR: 8.6%  MAR: 12.4%
 
 ``` r
-nor_de_rna  <- run_de(nor_qc_r$counts, nor$meta, TRUE)
-nor_common  <- intersect(rownames(nor_mi$mixed), rownames(nor_qc_r$counts))
+## RNA DE: validated standalone limma results (§2b resolution); `ctrl_time`
+## from the local fit, for the A3 diagnostic only -- see the Cadenza chunk.
+nor_de_rna <- load_validated_de("Norin")
+```
+
+    Validated DE (Norin): 59502 genes x 4 timepoints
+
+``` r
+nor_de_rna$ctrl_time <- run_de(nor_qc_r$counts, nor$meta, TRUE)$ctrl_time
+
+nor_common  <- Reduce(intersect, list(rownames(nor_mi$mixed),
+                                      rownames(nor_qc_r$counts),
+                                      rownames(nor_de_rna$lfc)))
 nor_de_prot <- run_de(nor_mi$mixed[nor_common, , drop = FALSE], nor$meta, FALSE)
 cat(sprintf("Universe B: %d matched genes\n", length(nor_common)))
 ```
@@ -1433,7 +1557,7 @@ cat(sprintf("RNA-responsive, eligible for amplitude fitting: %d / %d\n",
            sum(nor_rna_resp), length(nor_rna_resp)))
 ```
 
-    RNA-responsive, eligible for amplitude fitting: 3487 / 5159
+    RNA-responsive, eligible for amplitude fitting: 3533 / 5159
 
 ``` r
 nor_fit <- fit_hierarchical_kinetics(
@@ -1452,7 +1576,7 @@ cat(sprintf("Regulated by hierarchical model: %d / %d\n",
            sum(nor_fit$summary$regulated_95), nrow(nor_fit$summary)))
 ```
 
-    Regulated by hierarchical model: 1537 / 3487
+    Regulated by hierarchical model: 1562 / 3533
 
 ``` r
 nor_int <- run_integration(nor_qc_r$vst, nor_mi$mixed, nor$meta, nor$meta)
@@ -1464,9 +1588,9 @@ knitr::kable(data.frame(component = seq_along(nor_int$q2), Q2 = round(nor_int$q2
 
 | component |     Q2 | perm_q95 | p_value |
 |----------:|-------:|---------:|--------:|
-|         1 |  0.084 |    0.039 | 0.01990 |
-|         2 | -0.032 |   -0.146 | 0.01490 |
-|         3 |  0.033 |   -0.164 | 0.00498 |
+|         1 |  0.084 |    0.077 | 0.04480 |
+|         2 | -0.032 |   -0.059 | 0.03480 |
+|         3 |  0.033 |   -0.138 | 0.00498 |
 
 Norin: leave-one-cell-out Q2 vs permutation null
 
@@ -1494,8 +1618,8 @@ knitr::kable(ctrl_drift_summary,
 
 | variety | n_genes | median_abs_drift | pct_drift_over_1 | pct_drift_over_2 |
 |:--------|--------:|-----------------:|-----------------:|-----------------:|
-| Cadenza |    4228 |             0.67 |             31.9 |              8.7 |
-| Norin   |    3487 |             0.68 |             33.7 |             11.3 |
+| Cadenza |    4300 |             0.67 |             32.0 |              8.6 |
+| Norin   |    3533 |             0.69 |             34.1 |             11.7 |
 
 Control-arm drift: max \|log2FC\| from baseline, CONTROL arm only. A3
 assumes ~0.
@@ -1510,10 +1634,10 @@ knitr::kable(cbind(variety = "Cadenza", cad_a3$by_quartile),
 
 | variety | drift_quartile   |    n | median_drift | median_rna_amp | pct_regulated |
 |:--------|:-----------------|-----:|-------------:|---------------:|--------------:|
-| Cadenza | Q1 (most stable) | 1057 |         0.23 |           0.91 |          21.9 |
-| Cadenza | Q2               | 1057 |         0.50 |           1.22 |          19.9 |
-| Cadenza | Q3               | 1057 |         0.89 |           1.53 |          22.5 |
-| Cadenza | Q4 (most drift)  | 1057 |         1.73 |           2.46 |          23.7 |
+| Cadenza | Q1 (most stable) | 1075 |         0.24 |           0.90 |          22.1 |
+| Cadenza | Q2               | 1075 |         0.50 |           1.21 |          19.8 |
+| Cadenza | Q3               | 1075 |         0.89 |           1.50 |          22.9 |
+| Cadenza | Q4 (most drift)  | 1075 |         1.73 |           2.44 |          23.6 |
 
 Cadenza: regulated rate by control-drift quartile (UNADJUSTED,
 confounded – see next table)
@@ -1525,10 +1649,10 @@ knitr::kable(cbind(variety = "Norin", nor_a3$by_quartile),
 
 | variety | drift_quartile   |   n | median_drift | median_rna_amp | pct_regulated |
 |:--------|:-----------------|----:|-------------:|---------------:|--------------:|
-| Norin   | Q1 (most stable) | 872 |         0.26 |           0.90 |          21.3 |
-| Norin   | Q2               | 872 |         0.52 |           1.15 |          20.8 |
-| Norin   | Q3               | 871 |         0.91 |           1.31 |          24.3 |
-| Norin   | Q4 (most drift)  | 872 |         1.90 |           2.10 |          25.6 |
+| Norin   | Q1 (most stable) | 884 |         0.26 |           0.90 |          21.7 |
+| Norin   | Q2               | 883 |         0.52 |           1.14 |          20.8 |
+| Norin   | Q3               | 883 |         0.92 |           1.31 |          24.2 |
+| Norin   | Q4 (most drift)  | 883 |         1.94 |           2.09 |          26.4 |
 
 Norin: regulated rate by control-drift quartile (UNADJUSTED, confounded)
 
@@ -1546,10 +1670,10 @@ knitr::kable(a3_adj,
 
 | variety | term          | odds_ratio | ci_lo | ci_hi |  p_value |
 |:--------|:--------------|-----------:|------:|------:|---------:|
-| Cadenza | control drift |      1.071 | 0.988 | 1.159 | 9.12e-02 |
-| Cadenza | RNA amplitude |      1.047 | 0.966 | 1.133 | 2.56e-01 |
-| Norin   | control drift |      1.312 | 1.197 | 1.437 | 0.00e+00 |
-| Norin   | RNA amplitude |      0.763 | 0.686 | 0.845 | 3.00e-07 |
+| Cadenza | control drift |      1.060 | 0.979 | 1.146 | 1.45e-01 |
+| Cadenza | RNA amplitude |      1.056 | 0.975 | 1.141 | 1.76e-01 |
+| Norin   | control drift |      1.316 | 1.204 | 1.439 | 0.00e+00 |
+| Norin   | RNA amplitude |      0.777 | 0.701 | 0.859 | 1.20e-06 |
 
 ADJUSTED test: logistic regression of `regulated` on control drift + RNA
 amplitude (both z-scaled). Odds ratio per 1 SD.
@@ -1565,8 +1689,8 @@ knitr::kable(data.frame(
 
 | variety | spearman_raw | spearman_adjusted_for_rna_amp | collinearity_drift_vs_amp |
 |:--------|-------------:|------------------------------:|--------------------------:|
-| Cadenza |       -0.078 |                         0.039 |                     0.525 |
-| Norin   |       -0.048 |                         0.073 |                     0.443 |
+| Cadenza |       -0.075 |                         0.040 |                     0.519 |
+| Norin   |       -0.048 |                         0.076 |                     0.450 |
 
 Correlation between control drift and \|a - 1\|, before/after adjusting
 for RNA amplitude. Last column: collinearity between the two predictors
@@ -1890,8 +2014,8 @@ knitr::kable(
 
 | variety | n_chains | draws_per_chain | rhat_median | rhat_max | pct_rhat_over_1.05 | ess_median | ess_min |
 |:--------|---------:|----------------:|------------:|---------:|-------------------:|-----------:|--------:|
-| Cadenza |        4 |            2400 |      1.0011 |   1.0291 |                  0 |       1623 |     460 |
-| Norin   |        4 |            2400 |      1.0010 |   1.0181 |                  0 |       1625 |     482 |
+| Cadenza |        4 |            2400 |       1.001 |   1.0188 |                  0 |       1666 |     466 |
+| Norin   |        4 |            2400 |       1.001 |   1.0182 |                  0 |       1629 |     496 |
 
 B7 – MCMC convergence. R-hat near 1.00 means independent chains agree.
 Above 1.05 is a problem.
@@ -1905,8 +2029,8 @@ knitr::kable(
 
 | variety | pct_all_chains_agree | n_regulated_min | n_regulated_max |
 |:--------|---------------------:|----------------:|----------------:|
-| Cadenza |                 93.8 |             510 |             518 |
-| Norin   |                 94.8 |             548 |             557 |
+| Cadenza |                 95.1 |             550 |             563 |
+| Norin   |                 94.8 |             544 |             557 |
 
 Do independent chains make the SAME regulated/not call for each gene?
 
@@ -1919,14 +2043,14 @@ knitr::kable(
 
 | variety | p0_frac | n_regulated | pct_regulated | median_abs_a1 | cor_with_ref |
 |:--------|--------:|------------:|--------------:|--------------:|-------------:|
-| Cadenza |    0.05 |         512 |          42.7 |         0.949 |       0.9993 |
-| Cadenza |    0.10 |         514 |          42.8 |         0.954 |       0.9993 |
-| Cadenza |    0.20 |         511 |          42.6 |         0.954 |       1.0000 |
-| Cadenza |    0.40 |         512 |          42.7 |         0.954 |       0.9993 |
-| Norin   |    0.05 |         553 |          46.1 |         1.022 |       0.9995 |
-| Norin   |    0.10 |         553 |          46.1 |         1.017 |       0.9995 |
-| Norin   |    0.20 |         553 |          46.1 |         1.020 |       1.0000 |
-| Norin   |    0.40 |         553 |          46.1 |         1.019 |       0.9994 |
+| Cadenza |    0.05 |         562 |          46.8 |         0.970 |       0.9995 |
+| Cadenza |    0.10 |         558 |          46.5 |         0.977 |       0.9995 |
+| Cadenza |    0.20 |         550 |          45.8 |         0.970 |       1.0000 |
+| Cadenza |    0.40 |         558 |          46.5 |         0.984 |       0.9995 |
+| Norin   |    0.05 |         549 |          45.8 |         1.043 |       0.9993 |
+| Norin   |    0.10 |         547 |          45.6 |         1.034 |       0.9994 |
+| Norin   |    0.20 |         549 |          45.8 |         1.038 |       1.0000 |
+| Norin   |    0.40 |         550 |          45.8 |         1.035 |       0.9993 |
 
 B6 – horseshoe prior sensitivity. `p0_frac` is the assumed fraction of
 genes under real regulation; 0.20 is the default used throughout.
@@ -1940,14 +2064,14 @@ knitr::kable(
 
 | variety | n_iter | n_regulated | cor_with_longest |
 |:--------|-------:|------------:|-----------------:|
-| Cadenza |   1000 |         528 |           0.9905 |
-| Cadenza |   2000 |         518 |           0.9961 |
-| Cadenza |   4000 |         511 |           0.9981 |
-| Cadenza |   8000 |         512 |           1.0000 |
-| Norin   |   1000 |         564 |           0.9919 |
-| Norin   |   2000 |         556 |           0.9973 |
-| Norin   |   4000 |         553 |           0.9986 |
-| Norin   |   8000 |         554 |           1.0000 |
+| Cadenza |   1000 |         568 |           0.9909 |
+| Cadenza |   2000 |         562 |           0.9964 |
+| Cadenza |   4000 |         550 |           0.9985 |
+| Cadenza |   8000 |         553 |           1.0000 |
+| Norin   |   1000 |         546 |           0.9927 |
+| Norin   |   2000 |         545 |           0.9971 |
+| Norin   |   4000 |         549 |           0.9983 |
+| Norin   |   8000 |         552 |           1.0000 |
 
 Chain-length sensitivity. If `cor_with_longest` is ~1 by 2000
 iterations, the default chain is long enough.
@@ -1961,14 +2085,14 @@ knitr::kable(
 
 | variety | ci_level | n_regulated | pct_regulated |
 |:--------|---------:|------------:|--------------:|
-| Cadenza |     0.80 |         653 |          54.4 |
-| Cadenza |     0.90 |         575 |          47.9 |
-| Cadenza |     0.95 |         511 |          42.6 |
-| Cadenza |     0.99 |         431 |          35.9 |
-| Norin   |     0.80 |         688 |          57.3 |
-| Norin   |     0.90 |         606 |          50.5 |
-| Norin   |     0.95 |         553 |          46.1 |
-| Norin   |     0.99 |         467 |          38.9 |
+| Cadenza |     0.80 |         682 |          56.8 |
+| Cadenza |     0.90 |         609 |          50.7 |
+| Cadenza |     0.95 |         550 |          45.8 |
+| Cadenza |     0.99 |         473 |          39.4 |
+| Norin   |     0.80 |         674 |          56.2 |
+| Norin   |     0.90 |         602 |          50.2 |
+| Norin   |     0.95 |         549 |          45.8 |
+| Norin   |     0.99 |         460 |          38.3 |
 
 Credible-interval level sensitivity. Shows how much the `regulated`
 count depends on the (arbitrary) 95% convention.
@@ -2129,8 +2253,8 @@ knitr::kable(summ, caption = "Pipeline summary, both varieties")
 
 | variety | rna_genes_kept | protein_kept | universe_b | rna_responsive | lrt_regulated | bayes_regulated | integration_q2_c1 | integration_p_c1 |
 |:--------|---------------:|-------------:|-----------:|---------------:|--------------:|----------------:|------------------:|-----------------:|
-| Cadenza |          59931 |         5861 |       5580 |           4228 |          1050 |            1908 |             0.269 |          0.00995 |
-| Norin   |          59502 |         5641 |       5159 |           3487 |           896 |            1537 |             0.084 |          0.01990 |
+| Cadenza |          59931 |         5861 |       5580 |           4300 |          1050 |            1913 |             0.269 |           0.0149 |
+| Norin   |          59502 |         5641 |       5159 |           3533 |           896 |            1562 |             0.084 |           0.0448 |
 
 Pipeline summary, both varieties
 
@@ -2148,17 +2272,21 @@ The full statement of what is and is not supported is in the
 **Carry forward with confidence.** The Case B integration result (Q²
 against a permutation null on held-out design cells); the demonstration
 that transcript and protein responses are coupled but not identical;
-MNAR-dominant missingness; the finding that Cadenza is the
+abundance-dependent missingness; the finding that Cadenza is the
 better-behaved of the two datasets.
 
 **Carry forward as descriptive, with the denominator stated.** The
 archetype composition; the amplitude distribution; comparisons between
-large gene sets; cross-variety agreement on orthologues.
+large gene sets; cross-variety agreement on orthologues (χ² = 727.7,
+Cramér’s V = 0.220).
 
 **Do not carry forward.** Per-gene regulated/not-regulated calls; the
 count of regulated genes as a headline figure; any individual half-life;
-any mechanistic attribution to translation versus degradation; any raw
-DE count pending the reconciliation in `assumptions_validation.qmd` §2b.
+any mechanistic attribution to translation versus degradation; the claim
+that departures from the kinetic null demonstrate post-transcriptional
+regulation (they demonstrate transcript–protein discordance — see
+Conclusions claim 2); the assertion that every completely-missing cell
+is MNAR.
 
 ### Method caveats specific to this notebook
 
@@ -2173,9 +2301,16 @@ DE count pending the reconciliation in `assumptions_validation.qmd` §2b.
   “amplitude uncertainty at the point-estimate kinetics”, not full
   posterior uncertainty — and they additionally exclude RNA error
   entirely.
-- **~2% of RNA-responsive genes sit at the numerical safety bound**
-  (`at_bound = TRUE`). Their amplitudes are directional (“at least this
-  extreme”), not point estimates.
+- **~4% of RNA-responsive genes sit at the numerical safety bound**
+  (`at_bound = TRUE`; Cadenza 176 / 4,300). Their amplitudes are
+  directional (“at least this extreme”), not point estimates.
+- **The LRT null is not calibrated for this fitting procedure.** The χ²
+  approximation assumes a regular nested comparison, but the half-life
+  is chosen by grid search, RNA is estimated rather than known, the four
+  timepoint contrasts share fitted coefficients (so the diagonal
+  weighting understates their covariance), and protein variances are
+  estimated. A parametric bootstrap repeating the full procedure is
+  required before any p-value here is quoted as calibrated.
 - **No ground truth exists for real data.** §9’s cross-variety
   orthologue concordance is the best available external check, not proof
   of correctness — the two varieties are permitted to genuinely differ.
@@ -2184,18 +2319,25 @@ DE count pending the reconciliation in `assumptions_validation.qmd` §2b.
 
 Ordered by how much they would change what can be claimed:
 
-1.  **Resolve the DE reconciliation** (`assumptions_validation.qmd` §2b)
-    — 2–6× disagreement with the standalone limma workflow on identical
-    counts. Upstream of every downstream number.
-2.  **Propagate RNA uncertainty** into the kinetic model. This is what
+1.  **Investigate Norin’s 0 hpi baseline** (**17.6%** DE before
+    infection can act, against Cadenza’s 0.72%). Now the largest single
+    problem in the dataset, and it determines whether t0-centring is
+    defensible in Norin.
+2.  **Make the kinetic null control-aware** — joint arms, or a
+    time-varying baseline term. The control drifts (median 0.67 log2FC),
+    violating the steady-state assumption the ratio model rests on.
+3.  **Recalibrate the LRT by parametric bootstrap**, repeating the full
+    fit including grid selection.
+4.  **Propagate RNA uncertainty** into the kinetic model. This is what
     currently blocks per-gene claims.
-3.  **Investigate Norin’s 0 hpi baseline** (5.8% DE before infection can
-    act).
-4.  **Orthogonally validate 5–10 targets** (PRM / western / qPCR).
-5.  `docs/planning.md` S10 (functional enrichment) — run it on the
+5.  **Orthogonally validate 5–10 targets** (PRM / western / qPCR).
+6.  **Re-run `assumptions_validation.qmd`** against the validated DE —
+    its §2b is now obsolete, and its protein-SE sensitivity range needs
+    recomputing.
+7.  `docs/planning.md` S10 (functional enrichment) — run it on the
     kinetic archetypes, which passed their validation, rather than on
     the trajectory clusters, which did not.
-6.  `docs/planning.md` §4B–4E remain unbuilt; evaluate against the
+8.  `docs/planning.md` §4B–4E remain unbuilt; evaluate against the
     existing `rnaprot/` codebase on `nectar` first (see project memory
     `proj_existing_nectar_rnaprot.md`).
 

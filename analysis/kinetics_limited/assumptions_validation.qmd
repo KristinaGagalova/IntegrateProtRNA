@@ -27,21 +27,47 @@ A summary table of all verdicts is in §11.
 
 ## Executive summary --- what the tests found
 
-Five assumptions are violated, one is unresolved, and three hold. In order of how much they should change what gets claimed:
+> **This notebook now runs on the validated RNA DE.** `prepare_variety()` reads
+> the RNA treatment contrasts from the project's standalone limma workflow
+> rather than re-deriving them (see `R/load_validated_de.R`). That resolves what
+> §2b previously recorded as an unresolved 2--6× disagreement. **Every number
+> below that was computed under the superseded DE is marked ⚠ and must be
+> re-checked against this render** --- the prose was written before the change
+> and has not been recomputed by hand.
 
-1.  **B4 --- RNA treated as known (§7). Severely violated, and this is the headline.** `se_rna` is accepted by the model and never used. Propagating it by parametric bootstrap flips the regulated/not-regulated call for **36% of Cadenza genes and 49% of Norin genes**. That uncertainty is entirely absent from the reported credible intervals. *Per-gene regulation calls from this model should not be published without propagating RNA error or validating orthogonally.* Aggregate statements remain sound.
+Five assumptions are violated and three hold; the reconciliation that was
+previously unresolved is now settled. In order of how much they should change
+what gets claimed:
+
+1.  **B4 --- RNA treated as known (§7). Severely violated, and this is the headline.** `se_rna` is accepted by the model and never used. Propagating it by parametric bootstrap flips the regulated/not-regulated call for ⚠ **36% of Cadenza genes and 49% of Norin genes**. That uncertainty is entirely absent from the reported credible intervals. *Per-gene regulation calls from this model should not be published without propagating RNA error or validating orthogonally.* Aggregate statements remain sound.
+
+    ⚠ The two percentages are pre-change. The direction of this finding is
+    structural and will not reverse --- the standalone workflow's SEs are
+    recovered as \|logFC/t\| and are just as absent from the fitter --- but the
+    magnitudes will move, because the SEs themselves differ. Re-read §7's table.
 
 2.  **A1 --- first-order kinetics (§3). Violated.** Residuals are systematically structured by timepoint, in *opposite directions* in the two varieties (Cadenza's response peaks then falls; Norin's is delayed). Some genes will be flagged "regulated" because the trajectory *shape* is wrong, not because the amplitude departs from 1.
 
-3.  **Identifiability (§5).** Only **23--27%** of fitted genes have a half-life this design can resolve; \~50% sit above the bound and \~24% at the grid floor. The fitted `t_half` distribution is not an estimate of the wheat protein half-life distribution.
+3.  **Identifiability (§5). Worse than previously stated.** The "23--27% resolvable" figure counted fits pinned at the 12 h grid floor as identifiable. A fit at the floor means "≤ 12 h" --- it is censored. Cross-tabulating the `identifiable` flag against where each fit actually landed (from the main notebook's exported results, under the validated DE):
 
-4.  **B5 --- gene independence (§8). Violated.** Residual PC1 absorbs 62--69% of variance against 25% expected. The horseshoe treats correlated genes as independent evidence, so the model is more confident than it should be.
+    | | Cadenza (n = 5,580) | Norin (n = 5,159) |
+    |:--|--:|--:|
+    | Not identifiable | 2,732 (49.0%) | 2,651 (51.4%) |
+    | Identifiable, pinned at the 12 h floor | 1,304 (23.4%) | 908 (17.6%) |
+    | **Identifiable and inside the band** | **392 (7.0%)** | **643 (12.5%)** |
+    | Above the 72 h bound | 2,376 (42.6%) | 1,952 (37.8%) |
 
-5.  **A0 --- baseline equivalence (§2). Asymmetric.** Cadenza is clean (0.4% DE at 0 hpi); **Norin is not (5.8%)** --- a 14× difference at a timepoint where infection cannot yet have acted.
+    Only **7% of Cadenza and 13% of Norin** genes have a half-life this design resolves. The fitted `t_half` distribution is a property of the 0/24/48/72 h sampling window, not of the wheat proteome.
 
-6.  **Reconciliation (§2b). Unresolved.** This pipeline reports 2--6× fewer DE genes than the project's standalone limma workflow on counts that match exactly. Must be settled before any DE number is published.
+4.  **B5 --- gene independence (§8). Violated.** Residual PC1 absorbs ⚠ 62--69% of variance against 25% expected. The horseshoe treats correlated genes as independent evidence, so the model is more confident than it should be.
 
-Holding up: MNAR dominance (§10, Spearman −0.74), the horseshoe prior scale (§B6), and MCMC convergence after the adaptive-step fix (§B7).
+5.  **A0 --- baseline equivalence (§2). Severely asymmetric --- far worse than previously reported.** Under the validated DE, Cadenza is clean (**0.72%** DE at 0 hpi, 432/59,931) but **Norin is at 17.6%** (10,499/59,502) --- a **24×** difference at a timepoint where infection cannot yet have acted. The previously reported figures were 0.4% and 5.8%. This also undercuts the justification for t0-centring in Norin: `Rl - Rl[,1]` is defended as removing a batch artefact, but at 17.6% the Norin baseline contrast carries substantial real signal.
+
+6.  **Reconciliation (§2b). RESOLVED.** The RNA treatment contrasts are now read from the standalone workflow rather than re-derived, so the 2--6× disagreement no longer exists: there is one RNA DE result in the project. §2b is retained below as a record of the investigation, not as an open problem.
+
+Holding up: abundance-dependent missingness (§10, Spearman −0.74), the horseshoe prior scale (§B6), and MCMC convergence after the adaptive-step fix (§B7).
+
+Newly flagged, not previously listed: **the LRT null is not calibrated for this fitting procedure** --- the χ² approximation ignores grid-based half-life selection, estimated RNA, correlated timepoint contrasts, and estimated protein variances. A parametric bootstrap repeating the full procedure is needed before any p-value here is quoted as calibrated. And **abundance-dependent missingness is not the same claim as "every completely-missing cell is MNAR"**; §10 supports the former, not the latter.
 
 > **The overall picture.** The *aggregate* findings --- the distribution of amplitudes, the existence of post-transcriptional regulation, comparisons between large gene sets --- are supported. **Individual per-gene calls are not**, for the reasons in points 1--3. Any target list coming out of this analysis should be treated as a hypothesis-generating shortlist requiring orthogonal validation, not a result.
 
@@ -216,15 +242,42 @@ for (nm in names(VARIETIES)) {
 par(op)
 ```
 
-### Verdict
+### Verdict: severely asymmetric --- and Norin now crosses into double digits
 
 Read the `pct_DE_at_0hpi` column. A few percent is unremarkable; a double-digit percentage at 0 hpi means the arms were **not** equivalent at baseline, and t0-centring is subtracting a real (non-biological) difference from every subsequent timepoint. Where that happens, treat that variety's kinetic results as provisional and investigate sample handling / batch / labelling before interpreting them.
 
+**Under the validated DE, Norin does cross that line.** Computed directly from the standalone workflow's 0 dpi contrasts:
+
+| Variety | DE at 0 hpi (FDR \< 0.05) | Rate | Previously reported |
+|:--------|--------------------------:|-----:|--------------------:|
+| Cadenza | 432 / 59,931 | **0.72%** | 0.4% |
+| Norin   | 10,499 / 59,502 | **17.6%** | 5.8% |
+
+A **24×** asymmetry, not the 14× previously stated. Two consequences to carry forward:
+
+-   **Norin's kinetic results are provisional in the sense this verdict defines**, not merely "the weaker of the two datasets".
+-   **t0-centring is doing something different in each variety.** In Cadenza it removes a small baseline offset, as intended. In Norin it subtracts a contrast in which 17.6% of genes are individually significant --- that is not plausibly all artefact, so centring is removing real signal along with any batch effect. The step is still the right default (the kinetic model requires `p(0) = r(0) = 1`), but the interpretation "we removed a batch artefact" does not hold for Norin and should not be written that way.
+
 ------------------------------------------------------------------------
 
-## 2b. UNRESOLVED --- reconciliation with the standalone limma workflow
+## 2b. RESOLVED --- reconciliation with the standalone limma workflow
 
-### The assumption
+> **Status: closed.** This section previously recorded an unresolved 2--6×
+> disagreement. It is retained as the record of the investigation and of *why*
+> the pipeline now reads the standalone workflow's contrasts instead of
+> re-deriving them --- the test below still runs and still shows the
+> disagreement, because it deliberately re-derives DE locally in order to
+> compare. **The resolution was not to find the bug but to stop having two
+> answers**: `prepare_variety()` now takes the RNA treatment contrasts from the
+> standalone workflow (`R/load_validated_de.R`), so the project holds one RNA DE
+> result. The local fit is still used for the protein layer and for `ctrl_time`.
+>
+> The underlying cause was never identified. Anyone wanting to close that loop
+> should diff the two `voom()` objects' `E` and `weights` matrices directly; the
+> uniform deflation across every coefficient points at the variance estimate
+> rather than at the data or the contrast definition.
+
+### The assumption (as originally stated)
 
 `R/wheat_pipeline.R`'s `run_de()` is assumed to reproduce the project's existing standalone limma DE workflow (`DE-varieties-limma`), since both fit `~treatment*time` by voom + `eBayes(trend = TRUE)` to the same counts.
 
@@ -282,7 +335,7 @@ rec <- rec[, c("variety", "genes_kept_here", "genes_kept_reported",
 knitr::kable(rec, caption = "Does this pipeline reproduce the standalone limma workflow on the same counts?")
 ```
 
-### Verdict: DISCREPANCY, unresolved
+### Verdict: discrepancy real, cause unidentified, superseded by adopting the standalone result
 
 The gene counts match **exactly** in both varieties, which is strong evidence that the counts matrices and the filter are identical --- the filter depends on the count values, so an exact match is not a coincidence of annotation size. The design formula, reference levels and `eBayes(trend = TRUE)` call are also the same.
 
@@ -294,9 +347,11 @@ Things ruled out already:
 -   Different counts --- gene totals and post-filter counts match exactly.
 -   Different contrast --- `treatmentT1` here is the same coefficient as `treatmentInfected` there.
 
-**This must be resolved before the DE numbers are used in a manuscript**, because the two workflows disagree about how many genes respond. The most likely remaining candidates are a difference in sample-to-column alignment between metadata and counts in one of the two workflows, or the standalone workflow having been run against a different revision of the counts files. Anyone reproducing this should diff the two `voom()` objects' `E` and `weights` matrices directly.
+The most likely remaining candidates are a difference in sample-to-column alignment between metadata and counts in one of the two workflows, or the standalone workflow having been run against a different revision of the counts files. Anyone reproducing this should diff the two `voom()` objects' `E` and `weights` matrices directly.
 
-Note that the qualitative conclusion in §2 is unaffected: **both** workflows show Norin with far more 0 hpi signal than Cadenza (here 1,766 vs 51, a 35× ratio; there 10,499 vs 432, a 24× ratio).
+**How this was settled.** Not by finding the cause. The pipeline now reads the standalone workflow's published per-timepoint contrasts (`R/load_validated_de.R`), so the two answers no longer coexist and there is nothing left to reconcile. That is a defensible resolution because the standalone workflow is the one whose numbers appear elsewhere in the project, but it is worth being explicit that **the deflation was never explained** --- if the standalone workflow itself turns out to be the erroneous one, every downstream number moves.
+
+Note that the qualitative conclusion in §2 is unaffected either way: **both** workflows show Norin with far more 0 hpi signal than Cadenza (here 1,766 vs 51, a 35× ratio; in the standalone results now adopted, 10,499 vs 432, a 24× ratio).
 
 ------------------------------------------------------------------------
 
@@ -485,14 +540,32 @@ id_frac <- do.call(rbind, lapply(names(VARIETIES), function(nm) {
 knitr::kable(id_frac, caption = "Where the fitted half-lives fall relative to what the design can resolve.")
 ```
 
-### Verdict: only about a quarter of fitted genes are in the resolvable band
+### Verdict: far fewer than a quarter --- the "resolvable" column was over-counting
 
-| Variety | n fitted | at grid floor (≤12 h) | unidentifiable (\>72 h) | **resolvable** |
-|:--------|:---------|:----------------------|:------------------------|:---------------|
-| Cadenza | 4228     | 24.0%                 | 49.2%                   | **26.8%**      |
-| Norin   | 3487     | 24.0%                 | 53.1%                   | **22.9%**      |
+⚠ The table below is regenerated by the chunk above and its numbers will change
+on re-render; the correction it prompted does not.
 
-Roughly **half** of all fitted genes land above the identifiability bound, and another quarter sit pinned at the grid floor. Only **23--27%** have a half-life this design can actually estimate.
+| Variety | n fitted | at grid floor (≤12 h) | unidentifiable (\>72 h) | **"resolvable"** |
+|:--------|:---------|:----------------------|:------------------------|:-----------------|
+| Cadenza | 4228     | 24.0%                 | 49.2%                   | **26.8%**        |
+| Norin   | 3487     | 24.0%                 | 53.1%                   | **22.9%**        |
+
+**That last column is not what it appears to be.** It counts a fit pinned at the
+12 h grid floor as resolved, but a floor fit means "≤ 12 h" --- it is censored,
+and the design cannot distinguish a 12 h half-life from a 2 h one. Cross-tabulating
+the `identifiable` flag against grid position, from the main notebook's exported
+results under the validated DE:
+
+| | Cadenza (n = 5,580) | Norin (n = 5,159) |
+|:--|--:|--:|
+| Not identifiable | 2,732 (49.0%) | 2,651 (51.4%) |
+| Identifiable, pinned at the 12 h floor | 1,304 (23.4%) | 908 (17.6%) |
+| **Identifiable and genuinely inside the band** | **392 (7.0%)** | **643 (12.5%)** |
+| Above the 72 h bound | 2,376 (42.6%) | 1,952 (37.8%) |
+
+So the honest figure is **7% (Cadenza) and 13% (Norin)**, not 23--27%. Roughly
+half of all fitted genes land above the identifiability bound, and a further
+fifth to a quarter sit pinned at the floor.
 
 This matches the plant turnover literature rather than contradicting it: with *Arabidopsis* half-lives spanning hours to months [@li2017], a 72 h window sampled every 24 h was always going to see a narrow slice. The design is not broken --- it is being asked a question outside its resolution for most of the proteome.
 
@@ -812,7 +885,7 @@ knitr::kable(
 
 Two things to read here.
 
-**Treating every missing value as left-censored changes the answer.** The `downshift` scheme correlates only **0.66--0.70** with `mixed` on the same genes, shifts the median amplitude by 0.12--0.14, and drops the regulated count by \~30%. So the MAR/MNAR classification is not a formality --- it materially determines the amplitudes. That makes §10's confirmation of MNAR dominance load-bearing rather than decorative.
+**Treating every missing value as left-censored changes the answer.** The `downshift` scheme correlates only **0.66--0.70** with `mixed` on the same genes, shifts the median amplitude by 0.12--0.14, and drops the regulated count by \~30%. So the MAR/MNAR classification is not a formality --- it materially determines the amplitudes. That makes §10 load-bearing rather than decorative --- and it is also why §10's result should be read carefully: it establishes abundance-DEPENDENT missingness, not that every completely-missing cell is MNAR. The imputation rests on the stronger claim, which is assumed rather than tested.
 
 **The `complete_case` correlation of exactly 1.00 is expected, not reassuring.** A fully-observed protein has no imputed values, so its `mixed` matrix entries *are* its observed entries --- the amplitudes are identical by construction on that subset. What `complete_case` actually shows is the cost of refusing to impute: **only \~40% of proteins survive** (2340/5861 and 2293/5641), and the regulated count collapses to 143/130. That is the honest floor of what this dataset supports with no values invented at all.
 
@@ -861,7 +934,9 @@ par(op)
 knitr::kable(mnar_tab, caption = "Is missingness abundance-dependent (MNAR) in this dataset?")
 ```
 
-### Verdict: HOLDS --- clearly MNAR-dominant
+### Verdict: HOLDS as abundance-dependence --- which is a weaker claim than "MNAR-dominant"
+
+> **Wording caution.** A strong negative abundance-vs-missingness correlation establishes that missingness is *abundance-dependent*: low-abundance proteins go missing more often. It does **not** establish that each completely-missing design cell is MNAR rather than MAR --- that is an additional, untested inferential step, and the imputation scheme rests on it (§9 shows the MAR/MNAR split materially changes the amplitudes). Write "abundance-dependent missingness"; reserve "MNAR" for the modelling assumption, and cite it as an assumption. A dropout model that avoids imputation entirely (e.g. proDA) is the sensitivity analysis that would settle this.
 
 | Variety | Spearman(abundance, missing rate) | overall missing |
 |:--------|:----------------------------------|:----------------|
@@ -895,27 +970,27 @@ knitr::kable(data.frame(
                  "B8 delta_bound inert",
                  "Identifiability band",
                  "Imputation scheme",
-                 "MNAR dominance"),
+                 "Abundance-dependent missingness"),
   Tested_in = c("§2", "§3", "-- (is the null)", "main nb §8b", "§2b",
                 "-- (by construction)", "§6", "§7", "§8",
                 "main nb §8c", "main nb §8c", "main nb §8c",
                 "§5", "§9", "§10"),
   Verdict = c(
-    "ASYMMETRIC: Cadenza 0.4% vs Norin 5.8% DE at 0 hpi",
+    "SEVERELY ASYMMETRIC: Cadenza 0.72% vs Norin 17.6% DE at 0 hpi",
     "VIOLATED: structured residuals, opposite direction per variety",
     "Untestable by design (it is the null being tested)",
     "VIOLATED: median control drift ~0.67 log2FC",
-    "UNRESOLVED: 2-6x fewer DE than the standalone workflow",
+    "RESOLVED: standalone workflow's contrasts adopted; see 2b",
     "Known limitation, deliberate (no joint kd/a uncertainty)",
-    "Amplitude invariant algebraically; call count varies 3x",
-    "SEVERELY VIOLATED: 36% (Cad) / 49% (Nor) of calls flip",
+    "Amplitude invariant algebraically; sensitivity re-run due",
+    "SEVERELY VIOLATED: 36% (Cad) / 49% (Nor) of calls flip [pre-change]",
     "VIOLATED: residual PC1 = 62-69% vs 25% expected",
     "HOLDS: insensitive across p0_frac 0.05-0.40",
     "HOLDS after the adaptive step-size fix (0% R-hat > 1.05)",
-    "~2% of genes pinned at the bound",
-    "Only 23-27% of genes in the resolvable band",
+    "~4% of genes pinned at the bound",
+    "Only 7% (Cad) / 13% (Nor) genuinely in the resolvable band",
     "MAR/MNAR split matters (downshift cor 0.66-0.70)",
-    "HOLDS: Spearman -0.74 / -0.75, clearly MNAR")
+    "HOLDS as abundance-DEPENDENT: Spearman -0.74 / -0.75. NOT the same claim as every missing cell being MNAR")
 ), caption = "Every stated assumption, where it is tested, and the verdict on this dataset.")
 ```
 
