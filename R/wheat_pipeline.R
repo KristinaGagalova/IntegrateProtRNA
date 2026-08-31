@@ -152,6 +152,15 @@ run_qc_rna <- function(counts, meta, design,
 #' possible here: the supplied mapping files carry no such columns.
 run_qc_prot <- function(intensity, meta, min_valid_in_cell = 2) {
 
+  ## Sample columns must be in metadata row order. limma matches design-matrix
+  ## ROWS to expression-matrix COLUMNS positionally, and the cell indexing below
+  ## is positional too, so a mismatch mislabels every sample silently. This is
+  ## NOT hypothetical: as stored on disk, 3 of the 4 real matrices are in a
+  ## different order from their metadata (Norin RNA is lexicographic, so LH1
+  ## sits between LH19 and LH20). load_variety() reorders by name; this asserts
+  ## the reorder survived.
+  stopifnot(identical(colnames(intensity), rownames(meta)))
+
   m <- intensity
   m[m == 0] <- NA
   m <- log2(m)
@@ -189,6 +198,15 @@ run_qc_prot <- function(intensity, meta, min_valid_in_cell = 2) {
 run_missingness <- function(prot_norm, meta,
                             downshift = 1.8,
                             width     = 0.3) {
+
+  ## Sample columns must be in metadata row order. limma matches design-matrix
+  ## ROWS to expression-matrix COLUMNS positionally, and the cell indexing below
+  ## is positional too, so a mismatch mislabels every sample silently. This is
+  ## NOT hypothetical: as stored on disk, 3 of the 4 real matrices are in a
+  ## different order from their metadata (Norin RNA is lexicographic, so LH1
+  ## sits between LH19 and LH20). load_variety() reorders by name; this asserts
+  ## the reorder survived.
+  stopifnot(identical(colnames(prot_norm), rownames(meta)))
 
   cells <- levels(meta$cell)
   is_na <- is.na(prot_norm)
@@ -256,6 +274,15 @@ run_missingness <- function(prot_norm, meta,
 #' ~0+cell means model, but the bare `time` coefficients are also directly
 #' interpretable as the CONTROL arm's own drift, which the A3 diagnostic uses.
 run_de <- function(mat, meta, design, is_rna) {
+
+  ## Sample columns must be in metadata row order. limma matches design-matrix
+  ## ROWS to expression-matrix COLUMNS positionally, and the cell indexing below
+  ## is positional too, so a mismatch mislabels every sample silently. This is
+  ## NOT hypothetical: as stored on disk, 3 of the 4 real matrices are in a
+  ## different order from their metadata (Norin RNA is lexicographic, so LH1
+  ## sits between LH19 and LH20). load_variety() reorders by name; this asserts
+  ## the reorder survived.
+  stopifnot(identical(colnames(mat), rownames(meta)))
 
   meta$treatment <- relevel(
     factor(meta$treatment, levels = design$treatments),

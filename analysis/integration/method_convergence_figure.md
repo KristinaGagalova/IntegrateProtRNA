@@ -1,6 +1,6 @@
 # Method Convergence Figure (Fig 5)
 Kristina Gagalova
-2026-08-29
+2026-08-31
 
 - [Overview](#overview)
 - [Setup](#setup)
