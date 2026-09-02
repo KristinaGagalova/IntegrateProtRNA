@@ -1593,26 +1593,90 @@ density_data <- local({
 })
 
 # Create plot with ggplot2: separate panels per variety, overlaid densities
-p <- ggplot(density_data, aes(x = UMAP1, y = UMAP2, fill = modality)) +
-  facet_wrap(~variety, ncol = 2) +
-  stat_density2d(geom = "polygon", alpha = 0.42, bins = 6, contour = TRUE) +
-  scale_fill_manual(
-    values = c("RNA" = "#4A90E2", "Protein" = "#F5A623"),
-    guide = guide_legend(title = "Modality", reverse = FALSE)
+p <- ggplot(
+  density_data,
+  aes(x = UMAP1, y = UMAP2, fill = modality)
+) +
+  facet_wrap(~ variety, ncol = 2) +
+
+  stat_density_2d(
+    geom = "polygon",
+    alpha = 0.42,
+    bins = 6,
+    contour = TRUE,
+    colour = NA
   ) +
+
+  scale_fill_manual(
+    values = c(
+      "RNA"     = "#4A90E2",
+      "Protein" = "#F5A623"
+    ),
+    name = "Modality"
+  ) +
+
   labs(
     x = "UMAP 1",
-    y = "UMAP 2",
-    title = "Density: blue = RNA, orange = protein"
+    y = "UMAP 2"
   ) +
-  theme_minimal() +
+
+  theme_classic(base_size = 20) +
+
   theme(
-    panel.border = element_rect(fill = NA, color = "gray30", linewidth = 0.3),
-    panel.grid.minor = element_blank(),
-    panel.grid.major = element_line(color = "gray90", linewidth = 0.2),
-    strip.text = element_text(face = "bold", size = 11),
-    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
-    legend.position = "bottom"
+    strip.background = element_blank(),
+
+    strip.text = element_text(
+      face = "bold",
+      size = 22
+    ),
+
+    axis.title = element_text(
+      size = 22,
+      face = "bold"
+    ),
+
+    axis.text = element_text(
+      size = 18,
+      colour = "black"
+    ),
+
+    axis.line = element_line(
+      colour = "black",
+      linewidth = 0.8
+    ),
+
+    axis.ticks = element_line(
+      colour = "black",
+      linewidth = 0.7
+    ),
+
+    axis.ticks.length = unit(0.18, "cm"),
+
+    legend.position = "bottom",
+
+    legend.title = element_text(
+      size = 20,
+      face = "bold"
+    ),
+
+    legend.text = element_text(
+      size = 18
+    ),
+
+    legend.key.size = unit(0.8, "cm"),
+
+    panel.spacing = unit(1.5, "lines"),
+
+    plot.margin = margin(
+      12, 16, 12, 12
+    )
+  ) +
+
+  guides(
+    fill = guide_legend(
+      title.position = "left",
+      override.aes = list(alpha = 0.42)
+    )
   )
 
 print(p)
@@ -1802,14 +1866,94 @@ for (nm in c("Cadenza", "Norin")) {
 
     Warning in title(...): "alpha" is not a graphical parameter
 
-![V4: Correlation of gene distances across spaces. All three methods
-rank genes similarly (high Spearman rank correlation), but full space is
-the most informative for
-ranking.](gene_distance_shared_space_files/figure-commonmark/v4-correlation-comparisons-1.png)
+![V4: Full space vs. top-2 PCA. PCA tracks full-space ranking closely
+(high Spearman rank correlation) – see v4-agreement-table below for the
+UMAP comparison, which does
+not.](gene_distance_shared_space_files/figure-commonmark/v4-correlation-comparisons-1.png)
 
 ``` r
 par(op)
 ```
+
+`r_full_umap` and `r_pca_umap` above were computed but never reported –
+the loop only ever plotted full-vs-PCA. Surfacing them, plus what
+fraction of the genes each space would call “most discordant” actually
+agree with the full-space call, since a rank correlation alone can hide
+whether the *specific genes at the top of the table* (the ones anyone
+would actually follow up on) are the same genes:
+
+``` r
+v4_agreement <- do.call(rbind, lapply(c("Cadenza", "Norin"), function(nm) {
+  d <- GD[[nm]]$genes
+  k <- round(0.10 * nrow(d))
+  top_full <- d$gene_id[order(-d$d_full)][1:k]
+  top_pca  <- d$gene_id[order(-d$d_pca2)][1:k]
+  top_umap <- d$gene_id[order(-d$d_umap)][1:k]
+
+  data.frame(
+    variety                = nm,
+    n_genes                = nrow(d),
+    rho_full_vs_pca        = round(cor(d$d_full, d$d_pca2, method = "spearman"), 3),
+    rho_full_vs_umap       = round(cor(d$d_full, d$d_umap, method = "spearman"), 3),
+    rho_pca_vs_umap        = round(cor(d$d_pca2, d$d_umap, method = "spearman"), 3),
+    top10pct_overlap_pca_n = length(intersect(top_full, top_pca)),
+    top10pct_overlap_umap_n = length(intersect(top_full, top_umap)),
+    top10pct_n              = k
+  )
+}))
+
+knitr::kable(v4_agreement,
+            caption = "V4: how much of the full-space ranking survives PCA-2 vs. UMAP, on the real data. top10pct_overlap_*_n / top10pct_n is what fraction of the full-space 'most discordant' decile that projection still puts in its own most-discordant decile.")
+```
+
+| variety | n_genes | rho_full_vs_pca | rho_full_vs_umap | rho_pca_vs_umap | top10pct_overlap_pca_n | top10pct_overlap_umap_n | top10pct_n |
+|:--------|--------:|----------------:|-----------------:|----------------:|-----------------------:|------------------------:|-----------:|
+| Cadenza |    5580 |           0.869 |            0.549 |           0.682 |                    408 |                     179 |        558 |
+| Norin   |    5159 |           0.865 |            0.514 |           0.613 |                    380 |                     139 |        516 |
+
+V4: how much of the full-space ranking survives PCA-2 vs. UMAP, on the
+real data. top10pct_overlap\_\*\_n / top10pct_n is what fraction of the
+full-space ‘most discordant’ decile that projection still puts in its
+own most-discordant decile.
+
+``` r
+op <- par(mfrow = c(1, 2))
+
+for (nm in c("Cadenza", "Norin")) {
+  d <- GD[[nm]]$genes
+  r_full_umap <- cor(d$d_full, d$d_umap, method = "spearman")
+
+  plot(d$d_full, d$d_umap, pch = 19, col = "#2E86AB",
+       main = paste(nm, ": Full space vs UMAP\nSpearman ρ =", round(r_full_umap, 3)),
+       xlab = "Distance (full standardised space)",
+       ylab = "Distance (2D UMAP)")
+  abline(lm(d$d_umap ~ d$d_full), col = "#D1495B", lwd = 2)
+}
+```
+
+![V4b: Full space vs. 2D UMAP. Compare the spread here to
+v4-correlation-comparisons above – UMAP distance tracks full-space
+distance far more loosely than PCA does, consistent with the lower rho
+and top-decile overlap in
+v4-agreement-table.](gene_distance_shared_space_files/figure-commonmark/v4b-fig-full-vs-umap-1.png)
+
+``` r
+par(op)
+```
+
+**Reading this against §5’s G2 (simulated data):** there, compressing to
+2D UMAP cost ~2.6% AUC (0.820 -\> 0.799) for separating known-discordant
+genes from baseline – a small loss. On the real data, the loss looks
+much bigger by this measure: rho drops to ~0.51-0.55 (vs ~0.87 for
+PCA-2), and only ~27-32% of the genes in the full-space “most
+discordant” decile are still in UMAP’s own most-discordant decile (vs
+~73% for PCA-2). The two measures are not contradictory – G2’s AUC asks
+“does this space still separate archetypes on average,” which tolerates
+a lot of individual-gene reshuffling; the agreement table above asks “is
+it the *same genes* at the top,” which does not. For picking specific
+genes to follow up on (as in §8’s top-15 tables), the second question is
+the one that matters, and by that measure UMAP is a much less faithful
+summary of `d_full` than the AUC comparison alone would suggest.
 
 ------------------------------------------------------------------------
 
@@ -1860,11 +2004,11 @@ signal is real (G3: permutation p = 0.005). However:
 
 From G2 and V4:
 
-| Space                 | Use for ranking?        | AUC (discordant vs baseline) | Notes                                                                                         |
-|-----------------------|-------------------------|------------------------------|-----------------------------------------------------------------------------------------------|
-| **Full standardised** | ✅ Yes (A4 validated)   | 0.820                        | Most informative, distance preserved exactly                                                  |
-| **Top-2 PCA**         | ✅ Yes (nearly as good) | 0.827                        | Minimal loss of ranking power; visualisable as 2D plot                                        |
-| **2D UMAP**           | ⚠️ Use with caution     | 0.799                        | Designed for local structure, not global distances; loses ~2% AUC but more intuitive visually |
+| Space                 | Use for ranking?        | AUC (discordant vs baseline) | Notes                                                                                                                                                                                                                                                                                       |
+|-----------------------|-------------------------|------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Full standardised** | ✅ Yes (A4 validated)   | 0.820                        | Most informative, distance preserved exactly                                                                                                                                                                                                                                                |
+| **Top-2 PCA**         | ✅ Yes (nearly as good) | 0.827                        | Minimal loss of ranking power; visualisable as 2D plot                                                                                                                                                                                                                                      |
+| **2D UMAP**           | ⚠️ Use with caution     | 0.799                        | ~2% AUC loss on simulated archetypes, but on the real data (v4-agreement-table) rank correlation with `d_full` is only ρ≈0.51-0.55 and just ~27-32% of the top-decile “most discordant” genes agree with the full-space call – a much bigger practical loss than the AUC gap alone suggests |
 
 **Recommendation:**
 
